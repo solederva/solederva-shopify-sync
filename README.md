@@ -1,0 +1,1 @@
+# solederva-shopify-sync
