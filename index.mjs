@@ -21,14 +21,9 @@ function headers(json=true){
   if(json) h["Content-Type"] = "application/json";
   return h;
 }
-
 async function rest(path, method="GET", body){
   const url = `https://${SHOP_DOMAIN}.myshopify.com/admin/api/${API_VERSION}${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: headers(true),
-    body: body ? JSON.stringify(body) : undefined
-  });
+  const res = await fetch(url, { method, headers: headers(true), body: body ? JSON.stringify(body) : undefined });
   if(!res.ok){
     const t = await res.text().catch(()=>res.statusText);
     throw new Error(`Shopify ${method} ${path} -> ${res.status}: ${t}`);
@@ -46,10 +41,7 @@ async function publishProduct(productId){
   const pubId = await getOnlineStorePublicationId();
   if(!pubId) return;
   await rest(`/publications/${pubId}/publish.json`, 'POST', {
-    publication: {
-      publishable_id: productId,
-      publishable_type: "product"
-    }
+    publication: { publishable_id: productId, publishable_type: "product" }
   });
 }
 
@@ -71,10 +63,9 @@ async function setInventory(inventoryItemId, qty){
   });
 }
 
-/* ---------- Mevcut ürünleri bir defa yükle (idempotent) ---------- */
+/* ---------- Mevcut ürün indeksini yükle (idempotent) ---------- */
 async function loadProductIndex(){
-  // Map: modelTag -> {id, handle, tags[], images[], variants[]}
-  const map = new Map();
+  const map = new Map(); // model:<brand>|<baseTitle> -> product
   let pageInfo = null;
   while(true){
     const url = `/products.json?limit=250${pageInfo?`&page_info=${pageInfo}`:''}&fields=id,title,handle,tags,images,variants,status`;
@@ -93,25 +84,18 @@ async function loadProductIndex(){
   return map;
 }
 
-/* ---------- XML okuma ve gruplama ---------- */
-const COLOR_WORDS = [
-  'SIYAH','BEYAZ','KAHVE','LACIVERT','TABA','GRI','ANTRASIT','SAX','BEYAZ/SIYAH','SIYAH/BEYAZ','BYZ','AT','KE'
-];
+/* ---------- XML ayrıştırma ve gruplama ---------- */
+const COLOR_WORDS = ['SIYAH','BEYAZ','KAHVE','LACIVERT','TABA','GRI','ANTRASIT','SAX','BEYAZ/SIYAH','SIYAH/BEYAZ','BYZ','AT','KE'];
 
 function splitTitle(nameRaw){
-  // Ör: "MN002 - RBT Loafer Verniciata Erkek Ayakkabı SIYAH"
   const s = uc(nameRaw||"").replace(/\s+/g,' ').trim();
   const parts = s.split(' ');
-  // Son kelime renk ise ayır
   let color = parts[parts.length-1];
   if(!COLOR_WORDS.includes(color)) color = '';
   const base = color ? s.slice(0, s.lastIndexOf(' '+color)) : s;
   return { baseTitle: base, color };
 }
 function readableTitle(base, brand, mpn){
-  // Ör: "Loafer Verniciata Erkek Ayakkabı – RBT MOOİEN MN002R25490"
-  // base içinde baştaki kod/kısaltmaları temizleyip insanlar için daha net bırakıyoruz
-  // "MN002 - RBT Loafer ..." -> "Loafer ..."
   const pretty = base.replace(/^MN\d+\s*-\s*/,'').trim();
   return `${pretty} – ${brand} ${mpn}`.replace(/\s+/g,' ').trim();
 }
@@ -120,7 +104,6 @@ function parseXML(xml){
   const parser = new XMLParser({ ignoreAttributes:true, attributeNamePrefix:'', trimValues:true });
   const root = parser.parse(xml)||{};
   const list = [].concat(root?.Products?.Product||[]);
-  // Her Product; varyantlar altında beden/renk ve price/quantity var
   return list.map(p=>{
     const mpn       = (p.Mpn||'').trim();
     const brand     = (p.Brand||'').trim() || 'MOOİEN';
@@ -137,7 +120,7 @@ function parseXML(xml){
       .map(v=>{
         const specs = [].concat(v?.spec||[]);
         const renk  = uc(specs.find(s=>s?.name==='Renk')?.['#text'] || color || 'STANDART');
-        const beden = (specs.find(s=>s?.name==='Beden')?.['#text'] || '').trim();
+        const beden = String(specs.find(s=>s?.name==='Beden')?.['#text'] || '').trim();
         return {
           color : renk,
           size  : beden,
@@ -148,9 +131,7 @@ function parseXML(xml){
         };
       });
 
-    // Model grubunu oluşturmak için anahtar:
-    // – finisaj (CST/RST/CBT gibi) baseTitle içinde durur; sadece renk ayrıldı.
-    const modelKey  = `model:${brand}|${baseTitle}`; // TAG olarak da kullanacağız
+    const modelKey  = `model:${brand}|${baseTitle}`;
     const tags      = uniq([
       modelKey,
       `brand:${brand}`,
@@ -168,7 +149,6 @@ function groupByModel(items){
     const k = it.modelKey;
     if(!map.has(k)) map.set(k, { ...it, colors: new Map() });
     const g = map.get(k);
-    // renk -> {images, variants[]}
     const keyColor = it.colorDefault || 'STANDART';
     const node = g.colors.get(keyColor) || { images:[], variants:[] };
     node.images = uniq(node.images.concat(it.images));
@@ -178,7 +158,7 @@ function groupByModel(items){
   return Array.from(map.values());
 }
 
-/* ---------- Görsel imza/metafield ile idempotent yükleme ---------- */
+/* ---------- Metafield (image imzaları) ---------- */
 async function getMetaMap(productId){
   const js = await rest(`/products/${productId}/metafields.json`,'GET');
   const map = new Map();
@@ -186,8 +166,9 @@ async function getMetaMap(productId){
   return map;
 }
 async function setMeta(productId, namespace, key, value){
-  const payload = { metafield:{ namespace, key, value: JSON.stringify(value), type:'json' } };
-  await rest(`/products/${productId}/metafields.json`,'POST', payload);
+  await rest(`/products/${productId}/metafields.json`,'POST', {
+    metafield:{ namespace, key, value: JSON.stringify(value), type:'json' }
+  });
 }
 async function updateMeta(productId, metaMap, namespace, key, value){
   const full = `${namespace}:${key}`;
@@ -199,49 +180,38 @@ async function updateMeta(productId, metaMap, namespace, key, value){
     await setMeta(productId, namespace, key, value);
   }
 }
-
 function imageSign(url){ return url.replace(/^https?:\/\//,'').toLowerCase(); }
 
-/* ---------- Resim ekleme (sadece eksikler) ---------- */
+/* ---------- Görseller: sadece eksikleri yükle ---------- */
 async function ensureImages(product, colorImagesMap){
-  // metafield 'sync:images' -> ["cdn1.../a.jpg", ...]
   const metaMap = await getMetaMap(product.id);
   const current = JSON.parse(metaMap.get('sync:images')?.value || '[]');
   const wantAll = uniq([].concat(...Array.from(colorImagesMap.values()).map(x=>x.images||[])));
   const toAdd   = wantAll.filter(u => !current.includes(imageSign(u)));
 
-  // yalnız eksikleri yükle
-  const created = [];
   for(const src of toAdd){
     try{
-      const imgRes = await rest(`/products/${product.id}/images.json`,'POST', {
-        image: { src, alt: `SRC:${imageSign(src)}` }
-      });
-      created.push(imgRes?.image);
+      await rest(`/products/${product.id}/images.json`,'POST',{ image: { src, alt: `SRC:${imageSign(src)}` } });
       await sleep(350);
     }catch(e){
-      // zaman aşımı vs. sorunları yumuşat
       console.log('WARN image', src, String(e.message||e).slice(0,160));
     }
   }
 
-  // güncel listeyi yaz
   const merged = uniq(current.concat(wantAll.map(imageSign)));
   await updateMeta(product.id, metaMap, 'sync','images', merged);
 
-  // image_id eşlemesi için en güncel listeyi çek
   const imagesFull = (await rest(`/products/${product.id}/images.json`,'GET'))?.images||[];
   return imagesFull;
 }
 
-/* ---------- Varyant idempotent ekle/güncelle ---------- */
+/* ---------- Varyant idempotent ---------- */
 function keyVS(c,s){ return `${uc(c)}|${String(s||'')}`; }
 
 async function upsertVariants(product, colorImagesMap){
   const existing = product.variants || [];
   const byKey = new Map(existing.map(v=>[ keyVS(v.option1, v.option2), v ]));
 
-  // Her renk grubunun ilk görselini o rengin varyantlarına bağlayacağız
   const imagesFull = await ensureImages(product, colorImagesMap);
   const imageIdByColor = new Map();
   for(const [col, node] of colorImagesMap.entries()){
@@ -254,10 +224,11 @@ async function upsertVariants(product, colorImagesMap){
 
   for(const [col, node] of colorImagesMap.entries()){
     for(const v of node.variants){
-      const k = keyVS(v.color, v.size);
+      const sizeVal = v.size ? String(v.size) : 'Std'; // <-- boşsa Std
+      const k = keyVS(v.color, sizeVal);
       const ex = byKey.get(k);
+
       if(ex){
-        // güncelle (fiyat, stok, sku, barkod, image_id)
         try{
           await rest(`/variants/${ex.id}.json`,'PUT',{
             variant:{
@@ -266,7 +237,7 @@ async function upsertVariants(product, colorImagesMap){
               sku: v.sku || ex.sku,
               barcode: v.barcode || ex.barcode,
               option1: v.color,
-              option2: v.size || null,
+              option2: sizeVal,
               image_id: imageIdByColor.get(uc(v.color)) || ex.image_id || null
             }
           });
@@ -274,12 +245,11 @@ async function upsertVariants(product, colorImagesMap){
           await sleep(200);
         }catch(e){ console.log('WARN update variant', k, e.message); }
       }else{
-        // yeni varyant ekle
         try{
           const add = await rest(`/products/${product.id}/variants.json`, 'POST', {
             variant:{
               option1: v.color,
-              option2: v.size || null,
+              option2: sizeVal,
               price: to2(v.price),
               sku: v.sku || undefined,
               barcode: v.barcode || undefined,
@@ -288,16 +258,14 @@ async function upsertVariants(product, colorImagesMap){
           });
           const nv = add?.variant;
           if(nv){
-            if(imageIdByColor.get(uc(v.color))){
-              await rest(`/variants/${nv.id}.json`,'PUT',{
-                variant:{ id:nv.id, image_id: imageIdByColor.get(uc(v.color)) }
-              });
+            const imgId = imageIdByColor.get(uc(v.color));
+            if(imgId){
+              await rest(`/variants/${nv.id}.json`,'PUT',{ variant:{ id:nv.id, image_id: imgId } });
             }
             await setInventory(nv.inventory_item_id, v.qty);
             await sleep(250);
           }
         }catch(e){
-          // En çok görülen hata: "variant already exists" -> sessiz geç
           if(!/already exists/i.test(e.message||'')) console.log('WARN add variant', k, e.message);
         }
       }
@@ -333,40 +301,32 @@ async function main(){
 
   let processed = 0;
   for(const g of groups){
-    // Title & handle
     const title  = g.title;
-    const handleBase = (title.toLowerCase()
-      .replace(/[^\w]+/g,'-')
-      .replace(/-+/g,'-')
-      .replace(/^-|-$/g,'') || 'urun').slice(0,80);
-
-    const tagModel = g.modelKey; // ör: model:MOOİEN|MN002 - RBT ...
-    const found = index.get(tagModel);
+    const tagModel = g.modelKey;
 
     const productPayloadBase = {
       title,
-      body_html: '', // XML açıklamalarını istersen ekleyebiliriz
+      body_html: '',
       vendor: g.brand,
       product_type: 'Ayakkabı',
       tags: g.tags.join(', '),
-      options: ['Renk','Beden'],
-      status: 'active' // vitrine çıkması için aktif
+      // !!! Shopify bekliyor: options dizi-içinde {name: "..."} objeleri
+      options: [ { name: 'Color' }, { name: 'Size' } ],
+      status: 'active'
     };
 
+    const found = index.get(tagModel);
+
     if(!found){
-      // yeni ürün
       const p = await createProduct(productPayloadBase);
       if(!p) continue;
-      await publishProduct(p.id); // Online Store’a yayınla
-      // Görseller + varyantlar
+      await publishProduct(p.id);
       await upsertVariants(p, g.colors);
       await sleep(300);
       console.log(`OK (Yeni): ${clip(title,80)}`);
     }else{
-      // güncelle + idempotent
       const p = await updateProduct(found.id, productPayloadBase);
       await publishProduct(found.id);
-      // Görselleri sadece eksik olanları ekle, varyantları güncelle/ekle
       await upsertVariants({ ...found, ...p }, g.colors);
       await sleep(200);
       console.log(`OK (Güncel): ${clip(title,80)}`);
