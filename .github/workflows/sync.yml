@@ -1,11 +1,10 @@
 name: Shopify Sync
+
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: '*/30 * * * *'
-concurrency:
-  group: shopify-sync
-  cancel-in-progress: true
+    - cron: "*/30 * * * *"   # Her 30 dk (UTC)
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -14,17 +13,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '18'
+
       - name: Install deps
         run: npm ci || npm i
+
       - name: Run sync
         env:
-          SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          SOURCE_URL: ${{ secrets.SOURCE_URL }}
-          PRIMARY_DOMAIN: ${{ secrets.PRIMARY_DOMAIN }}
-          BATCH_SIZE: ${{ secrets.BATCH_SIZE }}
+          SHOP_DOMAIN:           ${{ secrets.SHOP_DOMAIN }}
+          SHOPIFY_ACCESS_TOKEN:  ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SOURCE_URL:            ${{ secrets.SOURCE_URL }}
+          PRIMARY_DOMAIN:        ${{ secrets.PRIMARY_DOMAIN }}
+          BATCH_SIZE:            ${{ secrets.BATCH_SIZE }}
         run: node index.mjs
