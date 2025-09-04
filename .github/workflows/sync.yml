@@ -1,9 +1,9 @@
 name: Shopify Sync
 
 on:
-  workflow_dispatch: {}        # Elle çalıştır
+  workflow_dispatch: {}
   schedule:
-    - cron: '${{ secrets.SCHEDULE_CRON || "*/30 * * * *" }}'   # Varsayılan: 30 dk
+    - cron: '*/30 * * * *'  # Her 30 dakikada bir (UTC)
 
 jobs:
   sync:
