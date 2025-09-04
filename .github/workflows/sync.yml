@@ -4,7 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       cleanup_images:
-        description: "Temizlik modu (imzalı resimleri XML'e göre sil)"
+        description: "Görsel temizliği (imzalı, XML'de olmayanları sil)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false","true"]
+      cleanup_variants:
+        description: "Varyant temizliği (XML'de olmayanları temizle)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false","true"]
+      variant_delete:
+        description: "Varyant temizliği yöntemi: true=Sil, false=Stok0+Satın alma engel"
         required: false
         default: "false"
         type: choice
@@ -37,4 +49,6 @@ jobs:
           PRIMARY_DOMAIN:        ${{ secrets.PRIMARY_DOMAIN }}
           BATCH_SIZE:            ${{ secrets.BATCH_SIZE }}
           CLEANUP_IMAGES:        ${{ github.event.inputs.cleanup_images }}
+          CLEANUP_VARIANTS:      ${{ github.event.inputs.cleanup_variants }}
+          VARIANT_DELETE:        ${{ github.event.inputs.variant_delete }}
         run: node index.mjs

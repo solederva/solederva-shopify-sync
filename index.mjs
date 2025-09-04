@@ -1,13 +1,17 @@
 import { XMLParser } from 'fast-xml-parser';
 
 /* ====== Config (Actions Secrets) ====== */
-const SHOP_DOMAIN   = process.env.SHOP_DOMAIN;      // ör: "shkx8d-wy"
-const ACCESS_TOKEN  = process.env.SHOPIFY_ACCESS_TOKEN;
-const API_VERSION   = "2024-07";
-const SOURCE_URL    = process.env.SOURCE_URL;
-const PRIMARY_DOMAIN= process.env.PRIMARY_DOMAIN || "www.solederva.com";
-const BATCH_SIZE    = Number(process.env.BATCH_SIZE || 50);
-const CLEANUP_IMAGES= /^(1|true|yes)$/i.test(process.env.CLEANUP_IMAGES || ''); // << TEMİZLİK MODU
+const SHOP_DOMAIN    = process.env.SHOP_DOMAIN;      // ör: "shkx8d-wy"
+const ACCESS_TOKEN   = process.env.SHOPIFY_ACCESS_TOKEN;
+const API_VERSION    = "2024-07";
+const SOURCE_URL     = process.env.SOURCE_URL;
+const PRIMARY_DOMAIN = process.env.PRIMARY_DOMAIN || "www.solederva.com";
+const BATCH_SIZE     = Number(process.env.BATCH_SIZE || 50);
+
+/* ---- Temizlik modları ---- */
+const CLEANUP_IMAGES   = /^(1|true|yes)$/i.test(process.env.CLEANUP_IMAGES   || '');
+const CLEANUP_VARIANTS = /^(1|true|yes)$/i.test(process.env.CLEANUP_VARIANTS || '');
+const VARIANT_DELETE   = /^(1|true|yes)$/i.test(process.env.VARIANT_DELETE   || ''); // true=sil, false=stok0+deny
 
 /* ====== Helpers ====== */
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
@@ -32,7 +36,7 @@ async function rest(path, method="GET", body){
   return await res.json().catch(()=> ({}));
 }
 
-/* ---------- Online Store publish (izin varsa) + fallback ---------- */
+/* ---------- Publish (izin varsa) + fallback ---------- */
 async function getOnlineStorePublicationId(){
   const pubs = await rest(`/publications.json`, 'GET');
   const pub = (pubs?.publications||[]).find(p=>/online/i.test(p.name));
@@ -218,7 +222,7 @@ async function ensureImages(product, colorImagesMap){
   let imagesFull = (await rest(`/products/${product.id}/images.json`,'GET'))?.images||[];
 
   if (CLEANUP_IMAGES){
-    // Sadece bizim yüklediğimiz imzalı (alt startsWith SRC:) resimler üzerinden temizlik
+    // Sadece imzalı (alt startsWith SRC:) resimler arasında temizlik
     const signed = imagesFull.map(im => {
       const alt = im.alt || '';
       const sig = alt.startsWith('SRC:') ? alt.slice(4) : null;
@@ -228,7 +232,7 @@ async function ensureImages(product, colorImagesMap){
     // Aynı imzadan fazla varsa ilkini bırak, diğerlerini sil
     const seen = new Set();
     for(const im of signed){
-      if(!im.sig) continue; // elle eklenenlere dokunma
+      if(!im.sig) continue; // imzasız = elle eklenmiş → dokunma
       const shouldExist = wantSet.has(im.sig);
       const isDup = seen.has(im.sig);
       if(!shouldExist || isDup){
@@ -246,14 +250,14 @@ async function ensureImages(product, colorImagesMap){
     imagesFull = (await rest(`/products/${product.id}/images.json`,'GET'))?.images||[];
   }
 
-  // Metafield: temizlik açıkken yalnızca "olması gereken"ler; değilse birleştir
+  // Metafield güncelle
   const merged = CLEANUP_IMAGES ? Array.from(wantSet) : uniq(current.concat(wantAll.map(imageSign)));
   await updateMeta(product.id, metaMap, 'sync','images', merged);
 
   return imagesFull;
 }
 
-/* ---------- Varyant idempotent ---------- */
+/* ---------- Varyant idempotent + temizlik ---------- */
 function keyVS(c,s){ return `${uc(c)}|${String(s||'')}`; }
 function variantPayload(v){
   return {
@@ -270,6 +274,13 @@ async function upsertVariants(product, colorImagesMap){
   const existing = product.variants || [];
   const byKey = new Map(existing.map(v=>[ keyVS(v.option1, v.option2), v ]));
 
+  const wantKeys = new Set();
+  for (const [, node] of colorImagesMap.entries()){
+    for (const v of (node.variants||[])){
+      wantKeys.add( keyVS(v.color, v.size || 'Std') );
+    }
+  }
+
   const imagesFull = await ensureImages(product, colorImagesMap);
   const imageIdByColor = new Map();
   for(const [col, node] of colorImagesMap.entries()){
@@ -280,11 +291,15 @@ async function upsertVariants(product, colorImagesMap){
     if(found) imageIdByColor.set(uc(col), found.id);
   }
 
+  // Ekle/güncelle
+  let totalQty = 0;
   for(const [col, node] of colorImagesMap.entries()){
     for(const v of node.variants){
       const sizeVal = v.size ? String(v.size) : 'Std';
       const k = keyVS(v.color, sizeVal);
       const ex = byKey.get(k);
+
+      totalQty += Number(v.qty||0);
 
       if(ex){
         try{
@@ -296,7 +311,7 @@ async function upsertVariants(product, colorImagesMap){
             }
           });
           await setInventory(ex.inventory_item_id, v.qty);
-          await sleep(200);
+          await sleep(180);
         }catch(e){ console.log('WARN update variant', k, e.message); }
       }else{
         try{
@@ -308,7 +323,7 @@ async function upsertVariants(product, colorImagesMap){
               await rest(`/variants/${nv.id}.json`,'PUT',{ variant:{ id:nv.id, image_id: imgId } });
             }
             await setInventory(nv.inventory_item_id, v.qty);
-            await sleep(250);
+            await sleep(220);
           }
         }catch(e){
           if(!/already exists/i.test(e.message||'')) console.log('WARN add variant', k, e.message);
@@ -316,6 +331,31 @@ async function upsertVariants(product, colorImagesMap){
       }
     }
   }
+
+  // TEMİZLİK: XML’de olmayan varyantlar
+  if (CLEANUP_VARIANTS){
+    for(const ex of existing){
+      const k = keyVS(ex.option1, ex.option2);
+      if(!wantKeys.has(k)){
+        try{
+          if(VARIANT_DELETE){
+            await rest(`/variants/${ex.id}.json`, 'DELETE');
+          }else{
+            // Silmeden pasifleştir: stok=0, satın almayı engelle
+            await rest(`/variants/${ex.id}.json`, 'PUT', {
+              variant:{ id: ex.id, inventory_policy: 'deny' }
+            });
+            await setInventory(ex.inventory_item_id, 0);
+          }
+          await sleep(150);
+        }catch(e){
+          console.log('WARN orphan variant', k, e.message);
+        }
+      }
+    }
+  }
+
+  return { totalQty };
 }
 
 /* ---------- Ürün oluştur/güncelle ---------- */
@@ -384,26 +424,37 @@ async function main(){
 
     const found = index.get(tagModel);
 
+    // create/update
+    let prod;
     if(!found){
       const seed = pickSeedVariant(g.colors);
       const firstImg = pickFirstImage(g.colors);
-      const p = await createProduct(productPayloadBase, seed, firstImg);
-      if(!p) continue;
-      if(p?.variants?.[0]) await setInventory(p.variants[0].inventory_item_id, seed.qty);
-      await publishProduct(p.id);
-      await upsertVariants(p, g.colors);
-      await sleep(300);
-      console.log(`OK (Yeni): ${clip(title,80)}`);
+      prod = await createProduct(productPayloadBase, seed, firstImg);
+      if(!prod) continue;
+      if(prod?.variants?.[0]) await setInventory(prod.variants[0].inventory_item_id, seed.qty);
+      await publishProduct(prod.id);
     }else{
-      const p = await updateProduct(found.id, { ...productPayloadBase /* options'a dokunmuyoruz */ });
+      prod = await updateProduct(found.id, { ...productPayloadBase /* options'a dokunmuyoruz */ });
       await publishProduct(found.id);
-      await upsertVariants({ ...found, ...p }, g.colors);
-      await sleep(200);
-      console.log(`OK (Güncel): ${clip(title,80)}`);
+      // eski product objesindeki variants listesini de kollayalım
+      prod = { ...found, ...prod };
     }
+
+    // varyant + görsel + temizlik
+    const { totalQty } = await upsertVariants(prod, g.colors);
+
+    // stok etiket yönetimi
+    const wantOpen = totalQty > 0;
+    const tagsArr = new Set((productPayloadBase.tags || '').split(',').map(s=>s.trim()).filter(Boolean));
+    // toggle
+    if(wantOpen){ tagsArr.delete('satis:kapali'); tagsArr.add('satis:acik'); }
+    else        { tagsArr.delete('satis:acik');   tagsArr.add('satis:kapali'); }
+
+    await updateProduct(prod.id, { tags: Array.from(tagsArr).join(', ') });
 
     processed++;
     if(processed % BATCH_SIZE === 0) await sleep(1000);
+    console.log(`OK: ${clip(title,80)} | Stok:${totalQty}`);
   }
 
   console.log('Bitti. İşlenen model:', processed);
