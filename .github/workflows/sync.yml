@@ -1,7 +1,14 @@
 name: Shopify Sync
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      cleanup_images:
+        description: "Temizlik modu (imzalı resimleri XML'e göre sil)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false","true"]
   schedule:
     - cron: "*/30 * * * *"   # Her 30 dk (UTC)
 
@@ -29,4 +36,5 @@ jobs:
           SOURCE_URL:            ${{ secrets.SOURCE_URL }}
           PRIMARY_DOMAIN:        ${{ secrets.PRIMARY_DOMAIN }}
           BATCH_SIZE:            ${{ secrets.BATCH_SIZE }}
+          CLEANUP_IMAGES:        ${{ github.event.inputs.cleanup_images }}
         run: node index.mjs

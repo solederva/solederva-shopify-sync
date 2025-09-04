@@ -7,6 +7,7 @@ const API_VERSION   = "2024-07";
 const SOURCE_URL    = process.env.SOURCE_URL;
 const PRIMARY_DOMAIN= process.env.PRIMARY_DOMAIN || "www.solederva.com";
 const BATCH_SIZE    = Number(process.env.BATCH_SIZE || 50);
+const CLEANUP_IMAGES= /^(1|true|yes)$/i.test(process.env.CLEANUP_IMAGES || ''); // << TEMİZLİK MODU
 
 /* ====== Helpers ====== */
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
@@ -38,25 +39,20 @@ async function getOnlineStorePublicationId(){
   return pub?.id;
 }
 async function fallbackMarkWeb(productId){
-  // read_publications izni yoksa burası devreye girer
   try {
-    await rest(`/products/${productId}.json`,'PUT',{
-      product:{ id: productId, status:'active', published_scope:'web' }
-    });
+    await rest(`/products/${productId}.json`,'PUT',{ product:{ id: productId, status:'active', published_scope:'web' } });
   } catch(e){
-    // bazı mağazalarda published_scope yazılamayabilir: hatayı yut
     console.log('PUBLISH-FALLBACK WARN:', String(e.message||e).slice(0,160));
   }
 }
 async function publishProduct(productId){
   try{
-    const pubId = await getOnlineStorePublicationId(); // <-- 403 alabilir
+    const pubId = await getOnlineStorePublicationId();
     if(!pubId) throw new Error('No publication id');
     await rest(`/publications/${pubId}/publish.json`, 'POST', {
       publication: { publishable_id: productId, publishable_type: "product" }
     });
   }catch(e){
-    // 403 veya başka bir hata: fallback’e düş
     console.log('PUBLISH via publications failed -> fallback web publish');
     await fallbackMarkWeb(productId);
   }
@@ -113,7 +109,6 @@ function splitTitle(nameRaw){
   return { baseTitle: base, color };
 }
 function readableTitle(base, brand, mpn){
-  // Markayı başta göstermiyoruz; sonuna koyuyoruz
   const pretty = base.replace(/^MN\d+\s*-\s*/,'').trim();
   return `${pretty} – ${brand} ${mpn}`.replace(/\s+/g,' ').trim();
 }
@@ -200,26 +195,61 @@ async function updateMeta(productId, metaMap, namespace, key, value){
 }
 function imageSign(url){ return url.replace(/^https?:\/\//,'').toLowerCase(); }
 
-/* ---------- Görseller: sadece eksikleri yükle ---------- */
+/* ---------- Görseller: eksik ekle + (opsiyonel) temizlik ---------- */
 async function ensureImages(product, colorImagesMap){
   const metaMap = await getMetaMap(product.id);
   const current = JSON.parse(metaMap.get('sync:images')?.value || '[]');
-  const wantAll = uniq([].concat(...Array.from(colorImagesMap.values()).map(x=>x.images||[])));
-  const toAdd   = wantAll.filter(u => !current.includes(imageSign(u)));
 
+  const wantAll = uniq([].concat(...Array.from(colorImagesMap.values()).map(x=>x.images||[])));
+  const wantSet = new Set(wantAll.map(imageSign));
+
+  // Eksik olanları ekle
+  const toAdd = wantAll.filter(u => !current.includes(imageSign(u)));
   for(const src of toAdd){
     try{
       await rest(`/products/${product.id}/images.json`,'POST',{ image: { src, alt: `SRC:${imageSign(src)}` } });
       await sleep(350);
     }catch(e){
-      console.log('WARN image', src, String(e.message||e).slice(0,160));
+      console.log('WARN image-add', src, String(e.message||e).slice(0,160));
     }
   }
 
-  const merged = uniq(current.concat(wantAll.map(imageSign)));
+  // Güncel listeyi çek
+  let imagesFull = (await rest(`/products/${product.id}/images.json`,'GET'))?.images||[];
+
+  if (CLEANUP_IMAGES){
+    // Sadece bizim yüklediğimiz imzalı (alt startsWith SRC:) resimler üzerinden temizlik
+    const signed = imagesFull.map(im => {
+      const alt = im.alt || '';
+      const sig = alt.startsWith('SRC:') ? alt.slice(4) : null;
+      return { ...im, sig };
+    });
+
+    // Aynı imzadan fazla varsa ilkini bırak, diğerlerini sil
+    const seen = new Set();
+    for(const im of signed){
+      if(!im.sig) continue; // elle eklenenlere dokunma
+      const shouldExist = wantSet.has(im.sig);
+      const isDup = seen.has(im.sig);
+      if(!shouldExist || isDup){
+        try{
+          await rest(`/products/${product.id}/images/${im.id}.json`,'DELETE');
+          await sleep(200);
+        }catch(e){
+          console.log('WARN image-del', im.id, String(e.message||e).slice(0,160));
+        }
+      } else {
+        seen.add(im.sig);
+      }
+    }
+    // Silme sonrası tekrar çek
+    imagesFull = (await rest(`/products/${product.id}/images.json`,'GET'))?.images||[];
+  }
+
+  // Metafield: temizlik açıkken yalnızca "olması gereken"ler; değilse birleştir
+  const merged = CLEANUP_IMAGES ? Array.from(wantSet) : uniq(current.concat(wantAll.map(imageSign)));
   await updateMeta(product.id, metaMap, 'sync','images', merged);
 
-  const imagesFull = (await rest(`/products/${product.id}/images.json`,'GET'))?.images||[];
   return imagesFull;
 }
 
@@ -290,7 +320,6 @@ async function upsertVariants(product, colorImagesMap){
 
 /* ---------- Ürün oluştur/güncelle ---------- */
 async function createProduct(payload, seedVariant, firstImage){
-  // options + EN AZ 1 varyant şart
   const js = await rest(`/products.json`,'POST',{
     product: {
       ...payload,
@@ -350,7 +379,7 @@ async function main(){
       vendor: g.brand,
       product_type: 'Ayakkabı',
       tags: g.tags.join(', '),
-      status: 'active' // ürün aktif
+      status: 'active'
     };
 
     const found = index.get(tagModel);
@@ -361,13 +390,13 @@ async function main(){
       const p = await createProduct(productPayloadBase, seed, firstImg);
       if(!p) continue;
       if(p?.variants?.[0]) await setInventory(p.variants[0].inventory_item_id, seed.qty);
-      await publishProduct(p.id);          // izin varsa publications, yoksa fallback web
-      await upsertVariants(p, g.colors);   // idempotent varyant+görsel
+      await publishProduct(p.id);
+      await upsertVariants(p, g.colors);
       await sleep(300);
       console.log(`OK (Yeni): ${clip(title,80)}`);
     }else{
-      const p = await updateProduct(found.id, { ...productPayloadBase, /* options dokunmadan */ });
-      await publishProduct(found.id);      // izin yoksa fallback çalışır
+      const p = await updateProduct(found.id, { ...productPayloadBase /* options'a dokunmuyoruz */ });
+      await publishProduct(found.id);
       await upsertVariants({ ...found, ...p }, g.colors);
       await sleep(200);
       console.log(`OK (Güncel): ${clip(title,80)}`);
