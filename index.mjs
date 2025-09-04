@@ -8,7 +8,7 @@ const SOURCE_URL    = process.env.SOURCE_URL;
 const PRIMARY_DOMAIN= process.env.PRIMARY_DOMAIN || "www.solederva.com";
 const BATCH_SIZE    = Number(process.env.BATCH_SIZE || 50);
 
-/* ====== Yardımcılar ====== */
+/* ====== Helpers ====== */
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 const num   = (x)=> { if(x==null) return 0; const n=Number(String(x).replace(',','.')); return isNaN(n)?0:n; };
 const to2   = (x)=> { const n=num(x); return n ? n.toFixed(2) : "0.00"; };
@@ -31,7 +31,7 @@ async function rest(path, method="GET", body){
   return await res.json().catch(()=> ({}));
 }
 
-/* ---------- Online Store’a otomatik yayın ---------- */
+/* ---------- Online Store publish ---------- */
 async function getOnlineStorePublicationId(){
   const pubs = await rest(`/publications.json`, 'GET');
   const pub = (pubs?.publications||[]).find(p=>/online/i.test(p.name));
@@ -45,7 +45,7 @@ async function publishProduct(productId){
   });
 }
 
-/* ---------- Lokasyon / stok ---------- */
+/* ---------- Location / Inventory ---------- */
 let LOCATION_ID_CACHE = null;
 async function getLocationId(){
   if(LOCATION_ID_CACHE) return LOCATION_ID_CACHE;
@@ -207,6 +207,16 @@ async function ensureImages(product, colorImagesMap){
 
 /* ---------- Varyant idempotent ---------- */
 function keyVS(c,s){ return `${uc(c)}|${String(s||'')}`; }
+function variantPayload(v){
+  return {
+    option1: v.color,
+    option2: v.size || 'Std',
+    price: to2(v.price),
+    sku: v.sku || undefined,
+    barcode: v.barcode || undefined,
+    inventory_management: 'shopify'
+  };
+}
 
 async function upsertVariants(product, colorImagesMap){
   const existing = product.variants || [];
@@ -224,7 +234,7 @@ async function upsertVariants(product, colorImagesMap){
 
   for(const [col, node] of colorImagesMap.entries()){
     for(const v of node.variants){
-      const sizeVal = v.size ? String(v.size) : 'Std'; // <-- boşsa Std
+      const sizeVal = v.size ? String(v.size) : 'Std';
       const k = keyVS(v.color, sizeVal);
       const ex = byKey.get(k);
 
@@ -233,11 +243,7 @@ async function upsertVariants(product, colorImagesMap){
           await rest(`/variants/${ex.id}.json`,'PUT',{
             variant:{
               id: ex.id,
-              price: to2(v.price),
-              sku: v.sku || ex.sku,
-              barcode: v.barcode || ex.barcode,
-              option1: v.color,
-              option2: sizeVal,
+              ...variantPayload({ ...v, size: sizeVal }),
               image_id: imageIdByColor.get(uc(v.color)) || ex.image_id || null
             }
           });
@@ -246,16 +252,7 @@ async function upsertVariants(product, colorImagesMap){
         }catch(e){ console.log('WARN update variant', k, e.message); }
       }else{
         try{
-          const add = await rest(`/products/${product.id}/variants.json`, 'POST', {
-            variant:{
-              option1: v.color,
-              option2: sizeVal,
-              price: to2(v.price),
-              sku: v.sku || undefined,
-              barcode: v.barcode || undefined,
-              inventory_management: 'shopify'
-            }
-          });
+          const add = await rest(`/products/${product.id}/variants.json`, 'POST', { variant: variantPayload({ ...v, size: sizeVal }) });
           const nv = add?.variant;
           if(nv){
             const imgId = imageIdByColor.get(uc(v.color));
@@ -274,8 +271,16 @@ async function upsertVariants(product, colorImagesMap){
 }
 
 /* ---------- Ürün oluştur/güncelle ---------- */
-async function createProduct(payload){
-  const js = await rest(`/products.json`,'POST',{ product: payload });
+async function createProduct(payload, seedVariant, firstImage){
+  // options + EN AZ 1 varyant şart
+  const js = await rest(`/products.json`,'POST',{
+    product: {
+      ...payload,
+      options: [ { name: 'Color' }, { name: 'Size' } ],
+      variants: [ variantPayload(seedVariant) ],
+      images: firstImage ? [{ src: firstImage, alt: `SRC:${imageSign(firstImage)}` }] : []
+    }
+  });
   return js?.product;
 }
 async function updateProduct(id, payload){
@@ -284,6 +289,23 @@ async function updateProduct(id, payload){
 }
 
 /* ----- Ana iş ----- */
+function pickSeedVariant(colorsMap){
+  for(const [, node] of colorsMap.entries()){
+    if(node.variants && node.variants.length){
+      const v = node.variants[0];
+      return { ...v, size: v.size || 'Std' };
+    }
+  }
+  return { color:'Default', size:'Std', price:0, qty:0, sku:'', barcode:'' };
+}
+function pickFirstImage(colorsMap){
+  for(const [, node] of colorsMap.entries()){
+    const img = node.images?.[0];
+    if(img) return img;
+  }
+  return null;
+}
+
 async function main(){
   if(!SHOP_DOMAIN || !ACCESS_TOKEN || !SOURCE_URL){
     console.error('Eksik ayar: SHOP_DOMAIN / SHOPIFY_ACCESS_TOKEN / SOURCE_URL');
@@ -310,22 +332,23 @@ async function main(){
       vendor: g.brand,
       product_type: 'Ayakkabı',
       tags: g.tags.join(', '),
-      // !!! Shopify bekliyor: options dizi-içinde {name: "..."} objeleri
-      options: [ { name: 'Color' }, { name: 'Size' } ],
       status: 'active'
     };
 
     const found = index.get(tagModel);
 
     if(!found){
-      const p = await createProduct(productPayloadBase);
+      const seed = pickSeedVariant(g.colors);
+      const firstImg = pickFirstImage(g.colors);
+      const p = await createProduct(productPayloadBase, seed, firstImg);
       if(!p) continue;
+      if(p?.variants?.[0]) await setInventory(p.variants[0].inventory_item_id, seed.qty);
       await publishProduct(p.id);
       await upsertVariants(p, g.colors);
       await sleep(300);
       console.log(`OK (Yeni): ${clip(title,80)}`);
     }else{
-      const p = await updateProduct(found.id, productPayloadBase);
+      const p = await updateProduct(found.id, { ...productPayloadBase, options: [ { name:'Color' }, { name:'Size' } ] });
       await publishProduct(found.id);
       await upsertVariants({ ...found, ...p }, g.colors);
       await sleep(200);
