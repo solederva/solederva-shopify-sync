@@ -1,10 +1,10 @@
 import { XMLParser } from "fast-xml-parser";
 
 /* ====== Config (GitHub Secrets) ====== */
-const SHOP_DOMAIN    = process.env.SHOP_DOMAIN;              // ör: "shkx8d-wy"
-const ACCESS_TOKEN   = process.env.SHOPIFY_ACCESS_TOKEN;     // shpat_...
+const SHOP_DOMAIN    = process.env.SHOP_DOMAIN;
+const ACCESS_TOKEN   = process.env.SHOPIFY_ACCESS_TOKEN;
 const API_VERSION    = "2024-07";
-const SOURCE_URL     = process.env.SOURCE_URL;               // XML canlı link
+const SOURCE_URL     = process.env.SOURCE_URL;
 const PRIMARY_DOMAIN = process.env.PRIMARY_DOMAIN || "www.solederva.com";
 const BATCH_SIZE     = Number(process.env.BATCH_SIZE || 50);
 
@@ -18,7 +18,7 @@ const uniq  = (arr)=> Array.from(new Set(arr.filter(Boolean)));
 const clip  = (str,max=90)=>{ const t=(str||"").toString().trim(); return t.length>max ? t.slice(0,max-1)+"…" : t; };
 const arr   = (x)=> Array.isArray(x) ? x : (x==null ? [] : [x]);
 
-// CDATA güvenli metin çözücü (her alanda bunu kullan)
+// CDATA güvenli okuma
 const txt = (node)=> {
   if(node==null) return "";
   if(typeof node === "object" && "__cdata" in node) return s(node.__cdata);
@@ -40,7 +40,29 @@ async function rest(path, method="GET", body){
   return res.json().catch(()=> ({}));
 }
 
-/* ===== XML oku & modele çevir ===== */
+/* ===== Renk eşleme (dosya adlarından) ===== */
+const COLOR_TOKENS = {
+  "SIYAH": ["siyah","black","sh"],
+  "BEYAZ": ["beyaz","white","byz","bz"],
+  "LACIVERT": ["lacivert","navy","lac"],
+  "KAHVE": ["kahve","brown","khv","kah"],
+  "GRI": ["gri","gray","grey","gry"],
+  "ANTRASIT": ["antrasit","anthracite","at"],
+  "MAVI": ["mavi","blue"],
+  "SAX": ["sax"],
+  "KREM": ["krem","cream","beige","bej"]
+};
+function matchImageForColor(images, color){
+  const c = uc(color);
+  const keys = COLOR_TOKENS[c] || [c.toLowerCase()];
+  for(const img of images){
+    const u = s(img.src).toLowerCase();
+    if(keys.some(k => u.includes(k))) return img.id;
+  }
+  return images[0]?.id || null;
+}
+
+/* ===== XML oku & modelle ===== */
 async function readXML(){
   const res = await fetch(SOURCE_URL);
   const xml = await res.text();
@@ -50,7 +72,7 @@ async function readXML(){
 
   const models = list.map(p=>{
     const mpn   = txt(p?.Mpn);
-    const brand = txt(p?.Brand);                               // << düzeltildi
+    const brand = txt(p?.Brand);
     const name  = txt(p?.Name);
     const main  = txt(p?.mainCategory);
     const cat   = txt(p?.category);
@@ -76,22 +98,30 @@ async function readXML(){
     });
 
     const { baseTitle } = buildTitle(name, brand, mpn);
-    return { mpn, brand, name, main, cat, price, tax, imgs, desc, baseTitle, variants };
+    const kategori = detectCategory({name, main, cat});
+    return { mpn, brand, name, main, cat, price, tax, imgs, desc, baseTitle, kategori, variants };
   });
 
   return models;
 }
+
 function buildTitle(name, brand, mpn){
-  // Örn: "MN002 - CST Loafer Pelle Erkek Ayakkabı SIYAH"
   const m = /^([A-Z0-9]+)\s*-\s*([A-Z]{3})\s*(.+)$/i.exec(name)||[];
   const codeFromName  = s(m[1]);
   const styleFromName = s(m[2]);
   let titleCore = s(m[3] || name);
-  // sonda renk kelimesini temizle (renk varyanta ait)
-  titleCore = titleCore.replace(/\b(SIYAH|BEYAZ|LACIVERT|KAHVE|GRI|ANTRASIT|SAX|MAVI|KREM)\b/gi,"").replace(/\s{2,}/g," ").trim();
+  titleCore = titleCore.replace(/\b(SIYAH|BEYAZ|LACIVERT|KAHVE|GRI|ANTRASIT|SAX|MAVI|KREM|BEJ)\b/gi,"").replace(/\s{2,}/g," ").trim();
   const style = styleFromName || "STD";
   const base  = `${titleCore} – ${style} ${uc(brand)} ${mpn || codeFromName}`.replace(/\s{2,}/g," ").trim();
   return { baseTitle: base };
+}
+
+function detectCategory({name, main, cat}){
+  const hay = uc([name, main, cat].filter(Boolean).join(" "));
+  if(/\bBOT\b/.test(hay)) return "bot";
+  if(/\bSPOR\b|\bSNEAK|TENI|COURT|RUN|TRAIN/i.test(hay)) return "spor";
+  if(/\bLOAFER|OXFORD|DERBY|PENNY|CLASSIC|PELLE|VERNICIATA/i.test(hay)) return "klasik";
+  return "spor";
 }
 
 /* ===== Shopify yardımcıları ===== */
@@ -108,12 +138,12 @@ async function findProductByTitle(title){
   const list = data?.products || [];
   return list.find(p => s(p.title) === s(title)) || null;
 }
-function mapVariantPayload(v){
+function variantPayload(v){
   return {
     sku: s(v.sku),
     barcode: s(v.barcode),
-    option1: s(v.color),   // "Renk"
-    option2: s(v.size),    // "Beden"
+    option1: s(v.color),   // Color
+    option2: s(v.size),    // Size
     price: to2(v.price),
     inventory_management: "shopify"
   };
@@ -138,14 +168,31 @@ async function linkImages(product, model){
     }catch(e){}
   }
 }
+async function linkVariantImages(product, model){
+  const imgs = (await rest(`/products/${product.id}/images.json`,'GET'))?.images || [];
+  if(!imgs.length) return;
+
+  // varyant → uygun image_id
+  for(const v of (product.variants||[])){
+    const xmlV = model.variants.find(x =>
+      s(x.barcode)&&s(x.barcode)===s(v.barcode) || (s(x.sku)&&s(x.sku)===s(v.sku)) ||
+      (s(x.color)===s(v.option1) && s(x.size)===s(v.option2))
+    ) || {};
+    const wanted = matchImageForColor(imgs, xmlV.color || v.option1 || "");
+    if(wanted && v.image_id !== wanted){
+      await rest(`/variants/${v.id}.json`, 'PUT', { variant: { id: v.id, image_id: wanted } });
+      await sleep(200);
+    }
+  }
+}
 async function ensureProductOptions(product){
-  // Option adları: "Renk","Beden"
-  const needUpdate =
-    s(product.options?.[0]?.name) !== "Renk" ||
-    s(product.options?.[1]?.name) !== "Beden";
-  if(needUpdate){
+  // Temalar için standart isimler: "Color", "Size"
+  const need =
+    s(product.options?.[0]?.name) !== "Color" ||
+    s(product.options?.[1]?.name) !== "Size";
+  if(need){
     await rest(`/products/${product.id}.json`, 'PUT', {
-      product: { id: product.id, options: [{ name:"Renk" }, { name:"Beden" }] }
+      product: { id: product.id, options: [{ name:"Color" }, { name:"Size" }] }
     });
     await sleep(200);
   }
@@ -167,10 +214,10 @@ async function ensureOptionStrings(product, xmlVariantsByBarcode){
   }
 }
 
-/* ===== Ürün oluştur (İLK VARYANTLA) ===== */
+/* ===== Ürün oluştur (İLK VARYANT) ===== */
 async function createProduct(model){
   const first = model.variants[0] || {
-    sku:"", barcode:"", color:"Tek", size:"Std", qty:0, price: model.price||0
+    sku:"", barcode:"", color:"Default", size:"Std", qty:0, price: model.price||0
   };
 
   const payload = {
@@ -183,10 +230,11 @@ async function createProduct(model){
         `brand:${model.brand}`,
         `mpn:${model.mpn}`,
         `from:xml`,
+        `kategori:${model.kategori}`,
         (model.price>0 ? "satis:acik" : "satis:kapali")
       ].join(", "),
-      options: [ { name: "Renk" }, { name: "Beden" } ],
-      variants: [ mapVariantPayload(first) ],
+      options: [ { name: "Color" }, { name: "Size" } ],
+      variants: [ variantPayload(first) ],
       images: model.imgs && model.imgs.length ? [{ src: model.imgs[0] }] : []
     }
   };
@@ -223,7 +271,7 @@ async function upsertVariant(product, v){
     await setInventory(found.inventory_item_id, v.qty);
     return found.id;
   }else{
-    const payload = { variant: mapVariantPayload(v) };
+    const payload = { variant: variantPayload(v) };
     const res = await rest(`/products/${product.id}/variants.json`, 'POST', payload).catch(async err=>{
       if(/already exists/i.test(String(err.message||""))){
         const fresh = await rest(`/products/${product.id}.json`, 'GET');
@@ -256,7 +304,7 @@ async function main(){
   const models = await readXML();
   console.log("Model sayısı:", models.length);
 
-  // Aynı modelin (MPN) tüm renk/numaralarını tek üründe topla
+  // Aynı MPN’yi tek ürün altında topla
   const groups = models.reduce((m, p)=>{
     const key = s(p.mpn) || s(p.baseTitle);
     (m.get(key) || m.set(key, []).get(key)).push(p);
@@ -275,24 +323,23 @@ async function main(){
       imgs    : uniq(items.flatMap(i=>i.imgs)),
       price   : primary.price,
       baseTitle: primary.baseTitle,
+      kategori: primary.kategori,
       variants: items.flatMap(i=>i.variants)
     };
 
-    // Ürünü bul/yoksa ilk varyantla oluştur
     let product = await findProductByTitle(merged.baseTitle);
     if(!product){
       product = await createProduct(merged);
       console.log("OK (Yeni):", merged.baseTitle, "| Varyant:", merged.variants.length);
     }else{
       console.log("OK (Güncel):", merged.baseTitle, "| Varyant:", merged.variants.length);
-      // Başlık değişmişse güncelle (eski [object Object] leri düzeltir)
       if(s(product.title) !== s(merged.baseTitle)){
         await rest(`/products/${product.id}.json`, 'PUT', { product: { id: product.id, title: merged.baseTitle } });
         await sleep(150);
       }
     }
 
-    // XML varyant → seçenek metinlerini düzelt (string)
+    // XML varyant değerlerini sabitle
     const xmlMap = new Map();
     for(const v of merged.variants){
       xmlMap.set(s(v.barcode) || s(v.sku), { color:s(v.color), size:s(v.size) });
@@ -300,16 +347,17 @@ async function main(){
     await ensureProductOptions(product);
     await ensureOptionStrings(product, xmlMap);
 
-    // Görselleri bağla
+    // Görseller + varyantlara image_id bağlama
     await linkImages(product, merged);
+    await linkVariantImages(product, merged);
 
-    // Tüm varyantları upsert + stok set
+    // Varyant upsert + stok
     for(const v of merged.variants){
       await upsertVariant(product, v);
       await sleep(120);
     }
 
-    // Fiyat kontrolü → hepsi 0 ise taslak
+    // Fiyat kontrolü → 0 ise taslak
     const minPrice = Math.min(...merged.variants.map(v=>num(v.price)));
     const status = (minPrice>0 ? "active" : "draft");
     if(s(product.status)!==status){
