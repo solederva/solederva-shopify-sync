@@ -1,4 +1,3 @@
-cat > index.mjs <<'JS'
 import { XMLParser } from "fast-xml-parser";
 
 /* ====== Config (GitHub Secrets) ====== */
@@ -318,4 +317,3 @@ main().catch(e=>{
   console.error("Hata:", e.message);
   process.exit(1);
 });
-JS
