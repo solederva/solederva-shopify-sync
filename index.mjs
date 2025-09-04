@@ -1,12 +1,12 @@
 import { XMLParser } from "fast-xml-parser";
 
 /* ====== Config (GitHub Secrets) ====== */
-const SHOP_DOMAIN   = process.env.SHOP_DOMAIN;              // ör: "shkx8d-wy"
-const ACCESS_TOKEN  = process.env.SHOPIFY_ACCESS_TOKEN;     // shpat_...
-const API_VERSION   = "2024-07";
-const SOURCE_URL    = process.env.SOURCE_URL;               // XML canlı link
-const PRIMARY_DOMAIN= process.env.PRIMARY_DOMAIN || "www.solederva.com";
-const BATCH_SIZE    = Number(process.env.BATCH_SIZE || 50);
+const SHOP_DOMAIN    = process.env.SHOP_DOMAIN;              // ör: "shkx8d-wy"
+const ACCESS_TOKEN   = process.env.SHOPIFY_ACCESS_TOKEN;     // shpat_...
+const API_VERSION    = "2024-07";
+const SOURCE_URL     = process.env.SOURCE_URL;               // XML canlı link
+const PRIMARY_DOMAIN = process.env.PRIMARY_DOMAIN || "www.solederva.com";
+const BATCH_SIZE     = Number(process.env.BATCH_SIZE || 50);
 
 /* ===== Helpers ===== */
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
@@ -17,6 +17,13 @@ const uc    = (x)=> s(x).toUpperCase();
 const uniq  = (arr)=> Array.from(new Set(arr.filter(Boolean)));
 const clip  = (str,max=90)=>{ const t=(str||"").toString().trim(); return t.length>max ? t.slice(0,max-1)+"…" : t; };
 const arr   = (x)=> Array.isArray(x) ? x : (x==null ? [] : [x]);
+
+// CDATA güvenli metin çözücü (her alanda bunu kullan)
+const txt = (node)=> {
+  if(node==null) return "";
+  if(typeof node === "object" && "__cdata" in node) return s(node.__cdata);
+  return s(node);
+};
 
 function headers(json=true){
   const h = { "X-Shopify-Access-Token": ACCESS_TOKEN };
@@ -42,40 +49,40 @@ async function readXML(){
   const list = arr(data?.Products?.Product);
 
   const models = list.map(p=>{
-    const mpn   = s(p?.Mpn);
-    const brand = s(p?.Brand);
-    const name  = s(p?.Name?.__cdata ?? p?.Name);
-    const main  = s(p?.mainCategory?.__cdata ?? p?.mainCategory);
-    const cat   = s(p?.category?.__cdata ?? p?.category);
+    const mpn   = txt(p?.Mpn);
+    const brand = txt(p?.Brand);                               // << düzeltildi
+    const name  = txt(p?.Name);
+    const main  = txt(p?.mainCategory);
+    const cat   = txt(p?.category);
     const price = num(p?.Price);
     const tax   = num(p?.Tax);
-    const imgs  = uniq([s(p?.Image1),s(p?.Image2),s(p?.Image3),s(p?.Image4),s(p?.Image5)])
+    const imgs  = uniq([txt(p?.Image1),txt(p?.Image2),txt(p?.Image3),txt(p?.Image4),txt(p?.Image5)])
                    .filter(x=>/^https?:\/\//i.test(x));
-    const desc  = s(p?.Description?.__cdata ?? p?.Description);
+    const desc  = txt(p?.Description);
 
-    const vars = arr(p?.variants?.variant).map(v=>{
+    const variants = arr(p?.variants?.variant).map(v=>{
       const specs = arr(v?.spec).reduce((o,it)=>{
-        const n = uc(it?.["@_name"] || "");
-        const val = s(it?.["#text"] ?? it?.__cdata ?? "");
+        const n = uc(txt(it?.["@_name"]));
+        const val = txt(it?.["#text"]) || txt(it);
         if(n==="RENK")  o.color = val;
         if(n==="BEDEN") o.size  = val;
         return o;
       }, {});
-      const sku     = s(v?.productCode?.__cdata ?? v?.productCode);
-      const barcode = s(v?.barcode?.__cdata ?? v?.barcode) || sku;
+      const sku     = txt(v?.productCode) || txt(v?.mpn);
+      const barcode = txt(v?.barcode) || sku;
       const qty     = num(v?.quantity);
       const vprice  = num(v?.price)>0 ? num(v?.price) : price;
       return { sku, barcode, color:s(specs.color), size:s(specs.size), qty, price:vprice };
     });
 
     const { baseTitle } = buildTitle(name, brand, mpn);
-    return { mpn, brand, name, main, cat, price, tax, imgs, desc, baseTitle, variants: vars };
+    return { mpn, brand, name, main, cat, price, tax, imgs, desc, baseTitle, variants };
   });
 
   return models;
 }
 function buildTitle(name, brand, mpn){
-  // "MN002 - CST Loafer Pelle Erkek Ayakkabı SIYAH"
+  // Örn: "MN002 - CST Loafer Pelle Erkek Ayakkabı SIYAH"
   const m = /^([A-Z0-9]+)\s*-\s*([A-Z]{3})\s*(.+)$/i.exec(name)||[];
   const codeFromName  = s(m[1]);
   const styleFromName = s(m[2]);
@@ -105,8 +112,8 @@ function mapVariantPayload(v){
   return {
     sku: s(v.sku),
     barcode: s(v.barcode),
-    option1: s(v.color),
-    option2: s(v.size),
+    option1: s(v.color),   // "Renk"
+    option2: s(v.size),    // "Beden"
     price: to2(v.price),
     inventory_management: "shopify"
   };
@@ -132,7 +139,7 @@ async function linkImages(product, model){
   }
 }
 async function ensureProductOptions(product){
-  // Option adları kesinlikle string: "Renk","Beden"
+  // Option adları: "Renk","Beden"
   const needUpdate =
     s(product.options?.[0]?.name) !== "Renk" ||
     s(product.options?.[1]?.name) !== "Beden";
@@ -160,9 +167,8 @@ async function ensureOptionStrings(product, xmlVariantsByBarcode){
   }
 }
 
-/* ===== Ürün oluştur (İLK VARYANTLA BİRLİKTE!) ===== */
+/* ===== Ürün oluştur (İLK VARYANTLA) ===== */
 async function createProduct(model){
-  // En az bir varyant göndermek zorundayız → ilkini kullan
   const first = model.variants[0] || {
     sku:"", barcode:"", color:"Tek", size:"Std", qty:0, price: model.price||0
   };
@@ -188,14 +194,13 @@ async function createProduct(model){
   const res = await rest(`/products.json`, 'POST', payload);
   const product = res?.product || null;
 
-  // ilk varyantın stoğunu da set edelim
   if(product?.variants?.[0]){
     await setInventory(product.variants[0].inventory_item_id, first.qty);
   }
   return product;
 }
 
-/* ===== Varyant upsert (varsa güncelle, yoksa ekle) ===== */
+/* ===== Varyant upsert ===== */
 async function upsertVariant(product, v){
   const variants = product?.variants || [];
   let found = variants.find(x => s(x.barcode)===s(v.barcode) && s(v.barcode)!=="")
@@ -219,7 +224,6 @@ async function upsertVariant(product, v){
     return found.id;
   }else{
     const payload = { variant: mapVariantPayload(v) };
-    // 422 olursa mevcut varyantı çek-güncelle
     const res = await rest(`/products/${product.id}/variants.json`, 'POST', payload).catch(async err=>{
       if(/already exists/i.test(String(err.message||""))){
         const fresh = await rest(`/products/${product.id}.json`, 'GET');
@@ -274,13 +278,18 @@ async function main(){
       variants: items.flatMap(i=>i.variants)
     };
 
-    // Ürünü bul/yoksa ilk varyantla birlikte oluştur
+    // Ürünü bul/yoksa ilk varyantla oluştur
     let product = await findProductByTitle(merged.baseTitle);
     if(!product){
       product = await createProduct(merged);
       console.log("OK (Yeni):", merged.baseTitle, "| Varyant:", merged.variants.length);
     }else{
       console.log("OK (Güncel):", merged.baseTitle, "| Varyant:", merged.variants.length);
+      // Başlık değişmişse güncelle (eski [object Object] leri düzeltir)
+      if(s(product.title) !== s(merged.baseTitle)){
+        await rest(`/products/${product.id}.json`, 'PUT', { product: { id: product.id, title: merged.baseTitle } });
+        await sleep(150);
+      }
     }
 
     // XML varyant → seçenek metinlerini düzelt (string)
@@ -297,10 +306,10 @@ async function main(){
     // Tüm varyantları upsert + stok set
     for(const v of merged.variants){
       await upsertVariant(product, v);
-      await sleep(150);
+      await sleep(120);
     }
 
-    // Tüm fiyatlar 0 ise taslak, değilse aktif
+    // Fiyat kontrolü → hepsi 0 ise taslak
     const minPrice = Math.min(...merged.variants.map(v=>num(v.price)));
     const status = (minPrice>0 ? "active" : "draft");
     if(s(product.status)!==status){
