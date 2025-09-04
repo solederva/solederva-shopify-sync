@@ -31,21 +31,38 @@ async function rest(path, method="GET", body){
   return await res.json().catch(()=> ({}));
 }
 
-/* ---------- Online Store publish ---------- */
+/* ---------- Online Store publish (izin varsa) + fallback ---------- */
 async function getOnlineStorePublicationId(){
   const pubs = await rest(`/publications.json`, 'GET');
   const pub = (pubs?.publications||[]).find(p=>/online/i.test(p.name));
   return pub?.id;
 }
+async function fallbackMarkWeb(productId){
+  // read_publications izni yoksa burası devreye girer
+  try {
+    await rest(`/products/${productId}.json`,'PUT',{
+      product:{ id: productId, status:'active', published_scope:'web' }
+    });
+  } catch(e){
+    // bazı mağazalarda published_scope yazılamayabilir: hatayı yut
+    console.log('PUBLISH-FALLBACK WARN:', String(e.message||e).slice(0,160));
+  }
+}
 async function publishProduct(productId){
-  const pubId = await getOnlineStorePublicationId();
-  if(!pubId) return;
-  await rest(`/publications/${pubId}/publish.json`, 'POST', {
-    publication: { publishable_id: productId, publishable_type: "product" }
-  });
+  try{
+    const pubId = await getOnlineStorePublicationId(); // <-- 403 alabilir
+    if(!pubId) throw new Error('No publication id');
+    await rest(`/publications/${pubId}/publish.json`, 'POST', {
+      publication: { publishable_id: productId, publishable_type: "product" }
+    });
+  }catch(e){
+    // 403 veya başka bir hata: fallback’e düş
+    console.log('PUBLISH via publications failed -> fallback web publish');
+    await fallbackMarkWeb(productId);
+  }
 }
 
-/* ---------- Location / Inventory ---------- */
+/* ---------- Lokasyon / stok ---------- */
 let LOCATION_ID_CACHE = null;
 async function getLocationId(){
   if(LOCATION_ID_CACHE) return LOCATION_ID_CACHE;
@@ -96,6 +113,7 @@ function splitTitle(nameRaw){
   return { baseTitle: base, color };
 }
 function readableTitle(base, brand, mpn){
+  // Markayı başta göstermiyoruz; sonuna koyuyoruz
   const pretty = base.replace(/^MN\d+\s*-\s*/,'').trim();
   return `${pretty} – ${brand} ${mpn}`.replace(/\s+/g,' ').trim();
 }
@@ -332,7 +350,7 @@ async function main(){
       vendor: g.brand,
       product_type: 'Ayakkabı',
       tags: g.tags.join(', '),
-      status: 'active'
+      status: 'active' // ürün aktif
     };
 
     const found = index.get(tagModel);
@@ -343,13 +361,13 @@ async function main(){
       const p = await createProduct(productPayloadBase, seed, firstImg);
       if(!p) continue;
       if(p?.variants?.[0]) await setInventory(p.variants[0].inventory_item_id, seed.qty);
-      await publishProduct(p.id);
-      await upsertVariants(p, g.colors);
+      await publishProduct(p.id);          // izin varsa publications, yoksa fallback web
+      await upsertVariants(p, g.colors);   // idempotent varyant+görsel
       await sleep(300);
       console.log(`OK (Yeni): ${clip(title,80)}`);
     }else{
-      const p = await updateProduct(found.id, { ...productPayloadBase, options: [ { name:'Color' }, { name:'Size' } ] });
-      await publishProduct(found.id);
+      const p = await updateProduct(found.id, { ...productPayloadBase, /* options dokunmadan */ });
+      await publishProduct(found.id);      // izin yoksa fallback çalışır
       await upsertVariants({ ...found, ...p }, g.colors);
       await sleep(200);
       console.log(`OK (Güncel): ${clip(title,80)}`);
