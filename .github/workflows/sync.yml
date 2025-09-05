@@ -16,13 +16,19 @@ on:
         type: choice
         options: ["false","true"]
       variant_delete:
-        description: "Varyant temizliği yöntemi: true=Sil, false=Stok0+Satın alma engel"
+        description: "Varyant temizliği yöntemi: true=Sil, false=Stok0+Engel"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false","true"]
+      diag:
+        description: "Teşhis çıktısı (model→renk/beden haritası)"
         required: false
         default: "false"
         type: choice
         options: ["false","true"]
   schedule:
-    - cron: "*/30 * * * *"   # Her 30 dk (UTC)
+    - cron: "*/30 * * * *"
 
 jobs:
   sync:
@@ -30,26 +36,19 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install deps
-        run: npm ci || npm i
-
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '18' }
+      - run: npm ci || npm i
       - name: Run sync
         env:
           SHOP_DOMAIN:           ${{ secrets.SHOP_DOMAIN }}
           SHOPIFY_ACCESS_TOKEN:  ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
           SOURCE_URL:            ${{ secrets.SOURCE_URL }}
-          PRIMARY_DOMAIN:        ${{ secrets.PRIMARY_DOMAIN }}
           BATCH_SIZE:            ${{ secrets.BATCH_SIZE }}
-          QPS:                   ${{ secrets.QPS }}                    # << HIZ SINIRI (öneri: 3)
+          QPS:                   ${{ secrets.QPS }}
           CLEANUP_IMAGES:        ${{ github.event.inputs.cleanup_images }}
           CLEANUP_VARIANTS:      ${{ github.event.inputs.cleanup_variants }}
           VARIANT_DELETE:        ${{ github.event.inputs.variant_delete }}
+          DIAG:                  ${{ github.event.inputs.diag }}
         run: node index.mjs
