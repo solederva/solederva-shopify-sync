@@ -6,14 +6,19 @@ const ACCESS_TOKEN   = process.env.SHOPIFY_ACCESS_TOKEN;
 const API_VERSION    = "2024-07";
 const SOURCE_URL     = process.env.SOURCE_URL;
 const PRIMARY_DOMAIN = process.env.PRIMARY_DOMAIN || "www.solederva.com";
-const BATCH_SIZE     = Number(process.env.BATCH_SIZE || 50);
+const BATCH_SIZE     = Number(process.env.BATCH_SIZE || 25);
 
 /* ---- Temizlik modları ---- */
 const CLEANUP_IMAGES   = /^(1|true|yes)$/i.test(process.env.CLEANUP_IMAGES   || '');
 const CLEANUP_VARIANTS = /^(1|true|yes)$/i.test(process.env.CLEANUP_VARIANTS || '');
-const VARIANT_DELETE   = /^(1|true|yes)$/i.test(process.env.VARIANT_DELETE   || ''); // true=sil, false=stok0+deny
+const VARIANT_DELETE   = /^(1|true|yes)$/i.test(process.env.VARIANT_DELETE   || '');
 
-/* ====== Helpers ====== */
+/* ---- Throttle / Backoff ---- */
+const QPS              = Number(process.env.QPS || 3); // saniyede en çok istek
+const MAX_RETRY        = 7;
+const BASE_BACKOFF_MS  = 1200; // 429/5xx sonrası taban bekleme
+let   lastRequestAt    = 0;
+
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 const num   = (x)=> { if(x==null) return 0; const n=Number(String(x).replace(',','.')); return isNaN(n)?0:n; };
 const to2   = (x)=> { const n=num(x); return n ? n.toFixed(2) : "0.00"; };
@@ -26,14 +31,50 @@ function headers(json=true){
   if(json) h["Content-Type"] = "application/json";
   return h;
 }
+
+async function throttleGate(){
+  const minGap = Math.max(10, Math.floor(1000 / Math.max(1, QPS)));
+  const now = Date.now();
+  const wait = Math.max(0, (lastRequestAt + minGap) - now);
+  if (wait) await sleep(wait + Math.floor(Math.random()*60)); // jitter
+  lastRequestAt = Date.now();
+}
+
 async function rest(path, method="GET", body){
   const url = `https://${SHOP_DOMAIN}.myshopify.com/admin/api/${API_VERSION}${path}`;
-  const res = await fetch(url, { method, headers: headers(true), body: body ? JSON.stringify(body) : undefined });
-  if(!res.ok){
-    const t = await res.text().catch(()=>res.statusText);
-    throw new Error(`Shopify ${method} ${path} -> ${res.status}: ${t}`);
+
+  for (let attempt = 0; attempt < MAX_RETRY; attempt++){
+    await throttleGate();
+
+    const res = await fetch(url, {
+      method,
+      headers: headers(true),
+      body: body ? JSON.stringify(body) : undefined
+    });
+
+    // 429 / 5xx → backoff + retry
+    if (res.status === 429 || res.status >= 500){
+      const ra = Number(res.headers.get('Retry-After')) || 0;
+      const backoff = ra > 0
+        ? ra * 1000
+        : Math.min(BASE_BACKOFF_MS * Math.pow(1.6, attempt), 15000);
+      await sleep(backoff + Math.floor(Math.random()*200));
+      continue;
+    }
+
+    // Diğer hatalar → metinle fırlat
+    if (!res.ok){
+      const t = await res.text().catch(()=>res.statusText);
+      throw new Error(`Shopify ${method} ${path} -> ${res.status}: ${t}`);
+    }
+
+    // Güvenli JSON parse
+    const text = await res.text().catch(()=>null);
+    if (!text) return {};
+    try { return JSON.parse(text); } catch { return {}; }
   }
-  return await res.json().catch(()=> ({}));
+
+  throw new Error(`Shopify ${method} ${path} -> too many retries`);
 }
 
 /* ---------- Publish (izin varsa) + fallback ---------- */
@@ -96,7 +137,7 @@ async function loadProductIndex(){
     }
     const m = link.match(/<([^>]+page_info=([^>]+))>; rel="next"/);
     if(m){ pageInfo = m[2]; } else break;
-    await sleep(200);
+    await sleep(120);
   }
   return map;
 }
@@ -212,7 +253,6 @@ async function ensureImages(product, colorImagesMap){
   for(const src of toAdd){
     try{
       await rest(`/products/${product.id}/images.json`,'POST',{ image: { src, alt: `SRC:${imageSign(src)}` } });
-      await sleep(350);
     }catch(e){
       console.log('WARN image-add', src, String(e.message||e).slice(0,160));
     }
@@ -238,7 +278,6 @@ async function ensureImages(product, colorImagesMap){
       if(!shouldExist || isDup){
         try{
           await rest(`/products/${product.id}/images/${im.id}.json`,'DELETE');
-          await sleep(200);
         }catch(e){
           console.log('WARN image-del', im.id, String(e.message||e).slice(0,160));
         }
@@ -311,7 +350,6 @@ async function upsertVariants(product, colorImagesMap){
             }
           });
           await setInventory(ex.inventory_item_id, v.qty);
-          await sleep(180);
         }catch(e){ console.log('WARN update variant', k, e.message); }
       }else{
         try{
@@ -323,7 +361,6 @@ async function upsertVariants(product, colorImagesMap){
               await rest(`/variants/${nv.id}.json`,'PUT',{ variant:{ id:nv.id, image_id: imgId } });
             }
             await setInventory(nv.inventory_item_id, v.qty);
-            await sleep(220);
           }
         }catch(e){
           if(!/already exists/i.test(e.message||'')) console.log('WARN add variant', k, e.message);
@@ -341,13 +378,11 @@ async function upsertVariants(product, colorImagesMap){
           if(VARIANT_DELETE){
             await rest(`/variants/${ex.id}.json`, 'DELETE');
           }else{
-            // Silmeden pasifleştir: stok=0, satın almayı engelle
             await rest(`/variants/${ex.id}.json`, 'PUT', {
               variant:{ id: ex.id, inventory_policy: 'deny' }
             });
             await setInventory(ex.inventory_item_id, 0);
           }
-          await sleep(150);
         }catch(e){
           console.log('WARN orphan variant', k, e.message);
         }
@@ -424,7 +459,6 @@ async function main(){
 
     const found = index.get(tagModel);
 
-    // create/update
     let prod;
     if(!found){
       const seed = pickSeedVariant(g.colors);
@@ -434,22 +468,18 @@ async function main(){
       if(prod?.variants?.[0]) await setInventory(prod.variants[0].inventory_item_id, seed.qty);
       await publishProduct(prod.id);
     }else{
-      prod = await updateProduct(found.id, { ...productPayloadBase /* options'a dokunmuyoruz */ });
+      prod = await updateProduct(found.id, { ...productPayloadBase });
       await publishProduct(found.id);
-      // eski product objesindeki variants listesini de kollayalım
       prod = { ...found, ...prod };
     }
 
-    // varyant + görsel + temizlik
     const { totalQty } = await upsertVariants(prod, g.colors);
 
-    // stok etiket yönetimi
+    // stok etiketleri
     const wantOpen = totalQty > 0;
     const tagsArr = new Set((productPayloadBase.tags || '').split(',').map(s=>s.trim()).filter(Boolean));
-    // toggle
     if(wantOpen){ tagsArr.delete('satis:kapali'); tagsArr.add('satis:acik'); }
     else        { tagsArr.delete('satis:acik');   tagsArr.add('satis:kapali'); }
-
     await updateProduct(prod.id, { tags: Array.from(tagsArr).join(', ') });
 
     processed++;

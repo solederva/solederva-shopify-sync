@@ -48,6 +48,7 @@ jobs:
           SOURCE_URL:            ${{ secrets.SOURCE_URL }}
           PRIMARY_DOMAIN:        ${{ secrets.PRIMARY_DOMAIN }}
           BATCH_SIZE:            ${{ secrets.BATCH_SIZE }}
+          QPS:                   ${{ secrets.QPS }}                    # << HIZ SINIRI (öneri: 3)
           CLEANUP_IMAGES:        ${{ github.event.inputs.cleanup_images }}
           CLEANUP_VARIANTS:      ${{ github.event.inputs.cleanup_variants }}
           VARIANT_DELETE:        ${{ github.event.inputs.variant_delete }}
