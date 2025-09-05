@@ -11,12 +11,17 @@ const BATCH_SIZE     = Number(process.env.BATCH_SIZE || 25);
 const CLEANUP_IMAGES   = /^(1|true|yes)$/i.test(process.env.CLEANUP_IMAGES   || '');
 const CLEANUP_VARIANTS = /^(1|true|yes)$/i.test(process.env.CLEANUP_VARIANTS || '');
 const VARIANT_DELETE   = /^(1|true|yes)$/i.test(process.env.VARIANT_DELETE   || '');
+
 /* Hız sınırı */
 const QPS              = Number(process.env.QPS || 3);
 const MAX_RETRY        = 7;
 const BASE_BACKOFF_MS  = 1200;
+
 /* Teşhis (harita dökümü) */
 const DIAG             = /^(1|true|yes)$/i.test(process.env.DIAG || '');
+
+/* Finish modu: 'split' (ayrı ürün) | 'option' (3. seçenek) */
+const FINISH_MODE      = (process.env.FINISH_MODE || 'split').toLowerCase(); // default split
 
 /* ====== Utils ====== */
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
@@ -77,7 +82,6 @@ async function publishProduct(productId){
       publication: { publishable_id: productId, publishable_type: "product" }
     });
   }catch{
-    // fallback: web publish
     try{
       await rest(`/products/${productId}.json`,'PUT',{ product:{ id: productId, status:'active', published_scope:'web' } });
     }catch(e){ console.log('PUBLISH-FALLBACK WARN:', String(e.message||e).slice(0,160)); }
@@ -98,9 +102,9 @@ async function setInventory(inventoryItemId, qty){
   await rest(`/inventory_levels/set.json`,'POST',{ location_id: locationId, inventory_item_id: inventoryItemId, available: Number(qty||0) });
 }
 
-/* ----- Mevcut ürün indeksini yükle (model:<brand>|<mpn>) ----- */
+/* ----- Mevcut ürün indeksini yükle (model:* tag) ----- */
 async function loadProductIndex(){
-  const map = new Map(); // model:<Marka>|<MPN> -> product
+  const map = new Map(); // model:<...> -> product
   let pageInfo = null;
   while(true){
     const url = `/products.json?limit=250${pageInfo?`&page_info=${pageInfo}`:''}&fields=id,title,tags,images,variants,status`;
@@ -125,8 +129,15 @@ const COLOR_WORDS = [
   'BEYAZ/SIYAH','SIYAH/BEYAZ','BYZ','AT','KE'
 ];
 
+function detectFinish(name, desc){
+  const s = uc((name||'') + ' ' + (desc||''));
+  if (/\bVERNICIATA\b/.test(s) || /\bPARLAK\b/.test(s)) return 'Parlak';
+  if (/\bMAT\b/.test(s)) return 'Mat';
+  // İstersen ileride 'Süet', 'Nubuk' vb. eklenir.
+  return null;
+}
+
 function extractBaseColor(nameRaw){
-  // İsim sonundaki renk kelimesini (varsa) yakalar; slash/işaretleri temizler
   const s = uc(nameRaw||'').replace(/[^\wÇĞİÖŞÜ\/\s-]/g,' ').replace(/\s+/g,' ').trim();
   const parts = s.split(' ');
   let color = parts[parts.length-1].replace(/[^\w\/-]/g,'').toUpperCase();
@@ -136,7 +147,6 @@ function extractBaseColor(nameRaw){
 }
 
 function niceTitle(base, brand, mpn){
-  // Başlıkta renk YOK; marka + mpn sonda
   const human = base.replace(/^MN\d+\s*-\s*/,'').trim();
   return `${human} – ${brand} ${mpn}`.replace(/\s+/g,' ').trim();
 }
@@ -149,7 +159,9 @@ function parseXML(xml){
     const mpn    = norm(p.Mpn||'');
     const brand  = norm(p.Brand||'') || 'MOOİEN';
     const name   = norm(p.Name||'');
+    const desc   = (p.Description||'').toString();
     const { baseTitle, colorGuess } = extractBaseColor(name);
+    const finish = detectFinish(name, desc); // 'Parlak' | 'Mat' | null
     const price  = num(p.Price);
     const tax    = num(p.Tax);
     const imgs   = uniq([p.Image1,p.Image2,p.Image3,p.Image4,p.Image5].filter(Boolean));
@@ -165,6 +177,7 @@ function parseXML(xml){
         return {
           color   : renk,
           size    : beden,
+          finish  : finish || 'Std',  // varyanta taşınır (option modunda)
           sku     : String(v.productCode||v.barcode||v.variantId||'').trim(),
           barcode : String(v.barcode||'').trim(),
           qty     : num(v.quantity),
@@ -172,51 +185,53 @@ function parseXML(xml){
         };
       });
 
-    const modelKey = `model:${brand}|${mpn}`;               // <<< ANA DEĞİŞİKLİK: MPN’e göre grupla
+    // Model anahtarı: MPN + (split modunda finish)
+    const baseKey  = `model:${brand}|${mpn}`;
+    const modelKey = (FINISH_MODE==='split' && finish) ? `${baseKey}|finish:${finish}` : baseKey;
+
     const title    = niceTitle(baseTitle, brand, mpn);
     const tags     = uniq([
-      modelKey,
+      baseKey,                                   // her ürünün temel modeli
+      modelKey,                                  // çalıştığımız ürünün spesifik anahtarı (split'te finish dahil)
       `brand:${brand}`,
       `kategori:${/BOT/i.test(cat+main)?'bot':/SPOR/i.test(cat+main)?'spor':'klasik'}`,
+      finish ? `finish:${finish}` : null,
       'satis:acik'
     ]);
 
-    return { mpn, brand, baseTitle, colorGuess, title, price, tax, images:imgs, variants, modelKey, tags };
+    return { mpn, brand, baseTitle, colorGuess, finish, title, price, tax, images:imgs, variants, modelKey, baseKey, tags };
   });
 }
 
-/* ====== Gruplama (MPN’e göre tek ürün) ====== */
+/* ====== Gruplama ====== */
 function groupByModel(items){
-  // -> [{mpn, brand, title, colors: Map<Color,{images,variants[]}>, tags}]
+  // split: modelKey (brand|mpn|finish?) tek ürün
+  // option: baseKey (brand|mpn) tek ürün; finish varyant alanına gider
   const map = new Map();
   for(const it of items){
-    if(!map.has(it.modelKey)){
-      map.set(it.modelKey, { mpn: it.mpn, brand: it.brand, title: it.title, tags: it.tags, colors: new Map() });
+    const key = (FINISH_MODE==='option') ? it.baseKey : it.modelKey;
+    if(!map.has(key)){
+      map.set(key, { mpn: it.mpn, brand: it.brand, title: it.title, tags: it.tags, colors: new Map(), finishMode: FINISH_MODE });
     }
-    const g = map.get(it.modelKey);
+    const g = map.get(key);
 
-    // Her ürün kaydı tipik olarak tek renktir; yine de varyantların kendi rengini baz al
-    // 1) Ürün düzeyindeki görselleri, o ürünün rengine (guess) yaz
     const colorForImages = it.colorGuess || (it.variants[0]?.color) || 'STANDART';
     const nodeImg = g.colors.get(colorForImages) || { images:[], variants:[] };
     nodeImg.images = uniq(nodeImg.images.concat(it.images));
     g.colors.set(colorForImages, nodeImg);
 
-    // 2) Varyantları kendi renk anahtarına dağıt
     for(const v of it.variants){
       const c = v.color || colorForImages;
       const node = g.colors.get(c) || { images:[], variants:[] };
-      // Aynı beden tekrarı olmasın
-      const key = `${c}|${v.size||'Std'}|${v.sku||''}`;
+      const key2 = `${c}|${v.size||'Std'}|${v.sku||''}|${v.finish||'Std'}`;
       if (!node._seen) node._seen = new Set();
-      if (!node._seen.has(key)){
+      if (!node._seen.has(key2)){
         node.variants.push(v);
-        node._seen.add(key);
+        node._seen.add(key2);
       }
       g.colors.set(c, node);
     }
   }
-  // Temizlik: _seen bayraklarını at
   for (const g of map.values()){
     for (const [c,node] of g.colors.entries()){
       delete node._seen;
@@ -258,7 +273,6 @@ async function ensureImages(product, colorImagesMap){
   const wantAll = uniq([].concat(...Array.from(colorImagesMap.values()).map(x=>x.images||[])));
   const wantSet = new Set(wantAll.map(imageSign));
 
-  // Eksik olanlar
   const toAdd = wantAll.filter(u => !current.includes(imageSign(u)));
   for(const src of toAdd){
     try{
@@ -276,7 +290,7 @@ async function ensureImages(product, colorImagesMap){
     });
     const seen = new Set();
     for(const im of signed){
-      if(!im.sig) continue; // imzasız = elle eklenmiş → dokunma
+      if(!im.sig) continue;
       const shouldExist = wantSet.has(im.sig);
       const isDup = seen.has(im.sig);
       if(!shouldExist || isDup){
@@ -295,25 +309,31 @@ async function ensureImages(product, colorImagesMap){
 }
 
 /* ====== Varyant upsert + temizlik ====== */
-function keyVS(c,s){ return `${uc(c)}|${String(s||'')}`; }
-function variantPayload(v){
-  return {
-    option1: v.color,                 // Türkçe isimleri aşağıda options'ta vereceğiz
+function keyVS(c,s,f, useFinish){ return useFinish ? `${uc(c)}|${String(s||'')}|${f||'Std'}` : `${uc(c)}|${String(s||'')}`; }
+
+function variantPayload(v, useFinish){
+  const base = {
+    option1: v.color,
     option2: v.size || 'Std',
     price: to2(v.price),
     sku: v.sku || undefined,
     barcode: v.barcode || undefined,
     inventory_management: 'shopify'
   };
+  return useFinish ? { ...base, option3: v.finish || 'Std' } : base;
 }
-async function upsertVariants(product, colorImagesMap){
+
+async function upsertVariants(product, colorImagesMap, useFinish){
   const existing = product.variants || [];
-  const byKey = new Map(existing.map(v=>[ keyVS(v.option1, v.option2), v ]));
+  const byKey = new Map(existing.map(v=>{
+    const k = useFinish ? keyVS(v.option1, v.option2, v.option3, true) : keyVS(v.option1, v.option2, null, false);
+    return [k, v];
+  }));
 
   const wantKeys = new Set();
   for (const [, node] of colorImagesMap.entries()){
     for (const v of (node.variants||[])){
-      wantKeys.add( keyVS(v.color, v.size || 'Std') );
+      wantKeys.add( keyVS(v.color, v.size || 'Std', useFinish ? (v.finish||'Std') : null, useFinish) );
     }
   }
 
@@ -327,12 +347,11 @@ async function upsertVariants(product, colorImagesMap){
     if(found) imageIdByColor.set(uc(col), found.id);
   }
 
-  // Ekle/güncelle
   let totalQty = 0;
   for(const [col, node] of colorImagesMap.entries()){
     for(const v of node.variants){
       const sizeVal = v.size ? String(v.size) : 'Std';
-      const k = keyVS(v.color, sizeVal);
+      const k = keyVS(v.color, sizeVal, useFinish ? (v.finish||'Std') : null, useFinish);
       const ex = byKey.get(k);
 
       totalQty += Number(v.qty||0);
@@ -340,13 +359,19 @@ async function upsertVariants(product, colorImagesMap){
       if(ex){
         try{
           await rest(`/variants/${ex.id}.json`,'PUT',{
-            variant:{ id: ex.id, ...variantPayload({ ...v, size: sizeVal }), image_id: imageIdByColor.get(uc(v.color)) || ex.image_id || null }
+            variant:{
+              id: ex.id,
+              ...variantPayload({ ...v, size: sizeVal }, useFinish),
+              image_id: imageIdByColor.get(uc(v.color)) || ex.image_id || null
+            }
           });
           await setInventory(ex.inventory_item_id, v.qty);
         }catch(e){ console.log('WARN update variant', k, e.message); }
       }else{
         try{
-          const add = await rest(`/products/${product.id}/variants.json`, 'POST', { variant: variantPayload({ ...v, size: sizeVal }) });
+          const add = await rest(`/products/${product.id}/variants.json`, 'POST', {
+            variant: variantPayload({ ...v, size: sizeVal }, useFinish)
+          });
           const nv = add?.variant;
           if(nv){
             const imgId = imageIdByColor.get(uc(v.color));
@@ -360,10 +385,9 @@ async function upsertVariants(product, colorImagesMap){
     }
   }
 
-  // XML’de olmayan varyantları temizle
   if (CLEANUP_VARIANTS){
     for(const ex of existing){
-      const k = keyVS(ex.option1, ex.option2);
+      const k = useFinish ? keyVS(ex.option1, ex.option2, ex.option3, true) : keyVS(ex.option1, ex.option2, null, false);
       if(!wantKeys.has(k)){
         try{
           if(VARIANT_DELETE){
@@ -381,14 +405,18 @@ async function upsertVariants(product, colorImagesMap){
 }
 
 /* ====== Ürün oluştur/güncelle ====== */
-async function createProduct(payload, seedVariant, firstImage){
+async function createProduct(payload, seedVariant, firstImage, useFinish){
+  const optionsArr = useFinish
+    ? [ { name:'Renk' }, { name:'Beden' }, { name:'Finish' } ]
+    : [ { name:'Renk' }, { name:'Beden' } ];
+
+  const seed = variantPayload(seedVariant, useFinish);
+
   const js = await rest(`/products.json`,'POST',{
     product: {
       ...payload,
-      // Türkçe seçenek adları:
-      options: [ { name: 'Renk' }, { name: 'Beden' } ],
-      // Shopify seçenek değerleri vardiyalı olarak option1/option2'ye düşer
-      variants: [ { ...variantPayload(seedVariant), option1: seedVariant.color, option2: seedVariant.size || 'Std' } ],
+      options: optionsArr,
+      variants: [ seed ],
       images: firstImage ? [{ src: firstImage, alt: `SRC:${imageSign(firstImage)}` }] : []
     }
   });
@@ -406,7 +434,7 @@ function pickSeedVariant(colorsMap){
       return { ...v, size: v.size || 'Std' };
     }
   }
-  return { color:'STANDART', size:'Std', price:0, qty:0, sku:'', barcode:'' };
+  return { color:'STANDART', size:'Std', price:0, qty:0, sku:'', barcode:'', finish:'Std' };
 }
 function pickFirstImage(colorsMap){
   for(const [, node] of colorsMap.entries()){
@@ -435,9 +463,10 @@ async function main(){
     for (const g of groups){
       const colors = Array.from(g.colors.entries()).map(([c,n])=>{
         const sizes = uniq(n.variants.map(v=>v.size||'Std')).join('/');
-        return `${c}(${n.variants.length}v,size:${sizes})`;
+        const fins  = uniq(n.variants.map(v=>v.finish||'Std')).join('/');
+        return `${c}(${n.variants.length}v,size:${sizes},finish:${fins})`;
       }).join(', ');
-      console.log(`GRUP: ${g.mpn} | ${g.brand} | ${g.title} -> ${colors}`);
+      console.log(`GRUP: ${g.brand}|${g.mpn} [mode:${g.finishMode}] -> ${colors}`);
     }
   }
 
@@ -445,7 +474,9 @@ async function main(){
 
   let processed = 0;
   for(const g of groups){
-    const tagModel = `model:${g.brand}|${g.mpn}`;
+    // split: tag model:<brand>|<mpn>|finish:Parlak   option: model:<brand>|<mpn>
+    const tagModel = Array.from(new Set((g.tags||[]).filter(t=>t.startsWith('model:')))).find(Boolean) || `model:${g.brand}|${g.mpn}`;
+
     const productPayloadBase = {
       title: g.title,
       body_html: '',
@@ -456,11 +487,13 @@ async function main(){
     };
 
     const found = index.get(tagModel);
+    const useFinish = (FINISH_MODE==='option');
+
     let prod;
     if(!found){
       const seed = pickSeedVariant(g.colors);
       const firstImg = pickFirstImage(g.colors);
-      prod = await createProduct(productPayloadBase, seed, firstImg);
+      prod = await createProduct(productPayloadBase, seed, firstImg, useFinish);
       if(!prod) continue;
       if(prod?.variants?.[0]) await setInventory(prod.variants[0].inventory_item_id, seed.qty);
       await publishProduct(prod.id);
@@ -470,7 +503,7 @@ async function main(){
       prod = { ...found, ...prod };
     }
 
-    const { totalQty } = await upsertVariants(prod, g.colors);
+    const { totalQty } = await upsertVariants(prod, g.colors, useFinish);
 
     // stok etiketi
     const wantOpen = totalQty > 0;
