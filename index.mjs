@@ -19,10 +19,9 @@ const HDRS = {
   'User-Agent': 'solederva-xml-sync/strict'
 };
 
-// Basit oran sınırlama
 async function rest(method, path, body) {
   const url = `${API_BASE}${path}`;
-  await sleep(350); // ~2-3 rps
+  await sleep(350);
   const res = await fetch(url, { method, headers: HDRS, body: body ? JSON.stringify(body) : undefined });
   if (res.status === 429) {
     const ra = Number(res.headers.get('Retry-After') || 1);
@@ -40,19 +39,21 @@ async function rest(method, path, body) {
 async function getLocations() {
   const data = await rest('GET', '/locations.json');
   if (!data.locations || !data.locations.length) throw new Error('Mağaza konumu bulunamadı.');
-  return data.locations[0].id; // ilk konum
+  return data.locations[0].id;
 }
 
 function normalizeImageUrl(u) {
   if (!u) return null;
   let s = String(u).trim();
   if (!s) return null;
-  // http -> https (aynı CDN, güvenli)
   if (s.startsWith('http://')) s = 'https://' + s.slice(7);
   return s;
 }
+function filenameFromUrl(u){
+  try{ return String(u).split('/').pop().split('?')[0].toLowerCase(); }catch(_){ return ''; }
+}
 
-// XML okuma
+// === XML ===
 async function loadXmlProducts() {
   const res = await fetch(SOURCE_URL, { redirect: 'follow' });
   const xml = await res.text();
@@ -79,9 +80,9 @@ async function loadXmlProducts() {
     const category = pickText(p.category);
     const images = [p.Image1, p.Image2, p.Image3, p.Image4, p.Image5]
       .map(normalizeImageUrl)
-      .filter(Boolean);
+      .filter(Boolean)
+      .slice(0,5);
 
-    // Varyantlar
     const vroot = p.variants?.variant || [];
     const vlist = Array.isArray(vroot) ? vroot : [vroot];
 
@@ -96,11 +97,10 @@ async function loadXmlProducts() {
       return { renk, beden, price: vprice > 0 ? vprice : price, qty, sku, barcode };
     });
 
-    // Seçenek adlarını XML’de geçtiği haliyle çıkar (sıralı ve tekille)
     const optionNames = uniquePreserve(
       vlist.flatMap(v => Object.keys(specsFromVariant(v))).filter(Boolean)
     );
-    // Eğer hiç spec yoksa tek seçenek de açmayacağız.
+
     return {
       handle: productHandle(productId, productCode, name),
       title: name,
@@ -118,7 +118,6 @@ function pickText(x) {
   if (x == null) return '';
   if (typeof x === 'string') return x.trim();
   if (typeof x === 'object') {
-    // CDATA desteği
     if (x.cdata) return String(x.cdata).trim();
     if ('#text' in x) return String(x['#text']).trim();
     if ('text' in x) return String(x.text).trim();
@@ -130,7 +129,6 @@ function num(x){ const n = Number(String(x ?? '').replace(',','.')); return isFi
 function toStr(x){ return x==null ? '' : String(x).trim(); }
 function uniquePreserve(arr){ const seen=new Set(); const out=[]; for(const a of arr){ if(!seen.has(a)){ seen.add(a); out.push(a);} } return out; }
 function productHandle(productId, productCode, name){
-  // Ürün başına tekil bir handle: öncelik Product_id → yoksa Product_code → yoksa Name
   const base = (productId || productCode || name || 'urun').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');
   return `feed-${base}`.slice(0,80);
 }
@@ -146,12 +144,11 @@ function specsFromVariant(v) {
   return out;
 }
 
-// Shopify yardımcıları
+// === Shopify REST yardımcıları ===
 async function findProductByHandle(handle){
   const data = await rest('GET', `/products.json?handle=${encodeURIComponent(handle)}&fields=id,handle`);
   return (data.products && data.products[0]) ? data.products[0] : null;
 }
-
 async function createProduct(payload){
   const data = await rest('POST', '/products.json', { product: payload });
   return data.product;
@@ -178,14 +175,66 @@ async function setInventory(inventory_item_id, location_id, available){
   });
 }
 
+// === Görsel Senkronu: max 5, tekrar yok, fazlayı temizle ===
+async function syncImages(productId, desiredUrls){
+  const want = (desiredUrls || []).map(normalizeImageUrl).filter(Boolean).slice(0,5);
+  const desiredNames = new Set(want.map(filenameFromUrl));
+
+  const imgsRes = await rest('GET', `/products/${productId}/images.json`);
+  const existing = imgsRes.images || [];
+  const existingNames = new Set(existing.map(i => (i.alt || filenameFromUrl(i.src))));
+
+  // Eksikleri ekle (alt = orijinal dosya adı)
+  for (const src of want){
+    const name = filenameFromUrl(src);
+    if (!existingNames.has(name)) {
+      try{
+        await rest('POST', `/products/${productId}/images.json`, { image: { src, alt: name } });
+        await sleep(250);
+      }catch(e){ console.warn('WARN image add:', e.message); }
+    }
+  }
+
+  // Son durumu çek
+  const after = (await rest('GET', `/products/${productId}/images.json`)).images || [];
+  const list = after.map(img => ({
+    id: img.id,
+    alt: img.alt || filenameFromUrl(img.src),
+    src: img.src
+  }));
+
+  // Tutulacaklar: desiredNames ile eşleşenlerden en fazla 5
+  const keep = [];
+  const seen = new Set();
+  for (const img of list) {
+    if (desiredNames.has(img.alt) && !seen.has(img.alt)) {
+      keep.push(img);
+      seen.add(img.alt);
+      if (keep.length >= 5) break;
+    }
+  }
+  // Hâlâ 5 değilse eskilerden doldur
+  for (const img of list) {
+    if (keep.length >= 5) break;
+    if (!keep.find(k => k.id === img.id)) keep.push(img);
+  }
+  const keepIds = new Set(keep.map(k => k.id));
+  for (const img of list) {
+    if (!keepIds.has(img.id)) {
+      try{
+        await rest('DELETE', `/products/${productId}/images/${img.id}.json`);
+        await sleep(150);
+      }catch(e){ console.warn('WARN image delete:', e.message); }
+    }
+  }
+}
+
 function makeProductPayload(item){
-  // Shopify options
   const options = (item.optionNames && item.optionNames.length)
     ? item.optionNames.map(n => ({ name: n }))
     : [];
 
-  // Shopify variants
-  const variants = (item.variants.length ? item.variants : [{ price: item.price || 0, qty: 0, sku: '', barcode: '' }]).map(v => {
+  const variants = (item.variants.length ? item.variants : [{ price: 0, qty: 0, sku: '', barcode: '' }]).map(v => {
     const opt = [];
     if (options.length) {
       for (const o of options) {
@@ -206,41 +255,41 @@ function makeProductPayload(item){
     };
   });
 
-  // Görseller
-  const images = (item.images || []).map(src => ({ src }));
-
+  // ÖNEMLİ: İlk yaratmada images boş; sonra syncImages() ekleyecek.
   return {
     title: item.title,
-    handle: item.handle,            // ilk yaratmada kullanılır
+    handle: item.handle,
     vendor: item.vendor || undefined,
     body_html: item.body_html || undefined,
     product_type: item.product_type || undefined,
     status: 'active',
     options,
     variants,
-    images
+    images: []
   };
 }
 
 async function upsertProductStrict(locId, item){
   const existing = await findProductByHandle(item.handle);
   if (!existing){
-    // CREATE
     const payload = makeProductPayload(item);
     const created = await createProduct(payload);
 
-    // Stok set
+    // Stoklar
     const freshVariants = await getVariants(created.id);
     for (let i=0;i<freshVariants.length;i++){
       const fv = freshVariants[i];
       const src = item.variants[i] || item.variants[0] || {};
       await setInventory(fv.inventory_item_id, locId, Math.max(0, Number(src.qty || 0)));
     }
+    // Görselleri senkle
+    await syncImages(created.id, item.images);
+
     console.log(`OK (Yeni): ${item.title} | Varyant: ${freshVariants.length}`);
     return;
   }
 
-  // UPDATE (başlık/açıklama/vendor/type/images dokun; varyantları SKU/BARCODE ile eşle)
+  // UPDATE
   const payload = {
     title: item.title,
     vendor: item.vendor || undefined,
@@ -250,19 +299,14 @@ async function upsertProductStrict(locId, item){
   };
   await updateProduct(existing.id, payload);
 
-  // Var olan varyantları çek
   const cur = await getVariants(existing.id);
-
-  // Eşleştirme anahtarı: sku -> barcode -> (renk|beden)
   const indexCur = new Map();
   for (const v of cur){
     const key = v.sku?.trim() || v.barcode?.trim() || `${v.option1}|${v.option2}|${v.option3}`;
     indexCur.set(key, v);
   }
 
-  // Hedef seçenek isimleri
   const options = (item.optionNames && item.optionNames.length) ? item.optionNames : [];
-  // Her kaynak varyant için upsert
   for (const sv of item.variants){
     const key = (sv.sku || sv.barcode || `${sv.renk||'Std'}|${sv.beden||'Std'}|`).trim();
     const match = indexCur.get(key);
@@ -271,12 +315,10 @@ async function upsertProductStrict(locId, item){
       barcode: sv.barcode || undefined,
       sku: sv.sku || undefined,
     };
-
-    // Seçenekleri yeniden yaz
     if (options.length){
       const optVals = [];
       for (const o of options){
-        const nm = (o || '').toLowerCase();
+        const nm = (o.name || '').toLowerCase();
         if (nm.includes('renk')) optVals.push(sv.renk || 'Std');
         else if (nm.includes('beden')) optVals.push(sv.beden || 'Std');
         else optVals.push('Seçenek');
@@ -285,39 +327,21 @@ async function upsertProductStrict(locId, item){
       variantPayload.option2 = optVals[1];
       variantPayload.option3 = optVals[2];
     }
-
     if (match){
-      // UPDATE
       const upd = await updateVariant(match.id, variantPayload);
       await setInventory(upd.inventory_item_id, locId, Math.max(0, Number(sv.qty || 0)));
     } else {
-      // ADD
       const added = await addVariant(existing.id, variantPayload);
       await setInventory(added.inventory_item_id, locId, Math.max(0, Number(sv.qty || 0)));
     }
   }
 
-  // Görseller (yalnızca eksik olanları ekle)
-  if (item.images?.length){
-    // üründeki mevcut görselleri çek
-    const imgs = await rest('GET', `/products/${existing.id}/images.json`);
-    const have = new Set((imgs.images||[]).map(i => i.src));
-    for (const src of item.images){
-      if (!have.has(src)){
-        try {
-          await rest('POST', `/products/${existing.id}/images.json`, { image: { src } });
-          await sleep(250);
-        } catch(e){
-          console.warn('WARN image add:', e.message);
-        }
-      }
-    }
-  }
+  // Görseller: dedupe + max5
+  await syncImages(existing.id, item.images);
 
   console.log(`OK (Güncellendi): ${item.title}`);
 }
 
-// MAIN
 async function main(){
   console.log('XML okunuyor…');
   const items = await loadXmlProducts();
@@ -325,13 +349,11 @@ async function main(){
 
   const locId = await getLocations();
 
-  // Sade batch: sırayla işle (limitleri zorlamayalım)
   for (const it of items){
     try{
       await upsertProductStrict(locId, it);
     }catch(err){
       console.error('HATA:', err.message);
-      // Devam et
     }
   }
 }
