@@ -6,15 +6,17 @@ const ACCESS_TOKEN  = process.env.SHOPIFY_ACCESS_TOKEN;
 const API_VERSION   = "2024-07";
 const SOURCE_URL    = process.env.SOURCE_URL;
 const BATCH_SIZE    = Number(process.env.BATCH_SIZE || 40);
-const QPS           = Number(process.env.QPS || 3);      // istek/sn
+const QPS           = Number(process.env.QPS || 3);      // istek/sn sınırı
 const MAX_RETRY     = 7;
 const BASE_BACKOFF  = 1200;
 
-// Opsiyonel bakım bayrakları
+// Bakım bayrakları (opsiyonel)
 const CLEANUP_IMAGES   = /^(1|true|yes)$/i.test(process.env.CLEANUP_IMAGES   || '');
 const CLEANUP_VARIANTS = /^(1|true|yes)$/i.test(process.env.CLEANUP_VARIANTS || '');
 const VARIANT_DELETE   = /^(1|true|yes)$/i.test(process.env.VARIANT_DELETE   || '');
-const DIAG             = /^(1|true|yes)$/i.test(process.env.DIAG || '');
+
+// Teşhis log’u
+const DIAG = /^(1|true|yes)$/i.test(process.env.DIAG || '');
 
 /* ====== Utils ====== */
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
@@ -24,6 +26,8 @@ const uc    = (s)=>(s||'').toString().trim().toUpperCase();
 const uniq  = (a)=>Array.from(new Set((a||[]).filter(Boolean)));
 const clip  = (s,m=90)=>{ s=String(s||''); return s.length>m? s.slice(0,m-1)+'…': s; };
 const norm  = (s)=>String(s??'').replace(/\s+/g,' ').trim();
+
+function toArr(x){ return x==null ? [] : (Array.isArray(x) ? x : [x]); }
 
 /* ====== Shopify REST + throttle/backoff ====== */
 function headers(json=true){
@@ -57,7 +61,7 @@ async function rest(path, method="GET", body){
   throw new Error(`Shopify ${method} ${path} -> too many retries`);
 }
 
-/* ====== Publish (izin yoksa fallback) ====== */
+/* ====== Yayınlama (izin yoksa fallback) ====== */
 async function getPublicationId(){
   try{
     const pubs = await rest(`/publications.json`,'GET');
@@ -114,12 +118,15 @@ async function loadProductIndex(){
   return map;
 }
 
-/* ====== XML parse & KATEGORİ ZEKÂSI ====== */
+/* ====== Sınıflandırma ve başlık ====== */
+function classify(main, cat){
+  const s = uc((main||'')+' '+(cat||''));          // SPOR / BOT / DERİ AYAKKABI vb.
+  if(/\bBOT\b/.test(s))  return { type:'Bot',             tag:'bot' };
+  if(/\bSPOR\b/.test(s)) return { type:'Spor Ayakkabı',   tag:'spor' };
+  return { type:'Klasik Ayakkabı', tag:'klasik' };       // DERİ vb. -> Klasik
+}
 
-const COLOR_WORDS = [
-  'SIYAH','BEYAZ','KAHVE','LACIVERT','TABA','GRI','ANTRASIT','SAX','BYZ','BEYAZ/SIYAH','SIYAH/BEYAZ'
-];
-
+// Aile (family) kodu: MN2505..., Name başındaki "MN2505 - ..." gibi
 function extractFamily(name, mpn, productCode){
   const candidates = [];
   if(name){ const m = String(name).match(/^\s*([A-Z]{2}\d{3,5})\s*-/); if(m) candidates.push(m[1]); }
@@ -130,9 +137,11 @@ function extractFamily(name, mpn, productCode){
 
 function extractBaseColor(nameRaw){
   const s = uc(nameRaw||'').replace(/[^\wÇĞİÖŞÜ\/\s-]/g,' ').replace(/\s+/g,' ').trim();
+  // Çoğu isimde renk sonda: "... SIYAH", "... BEYAZ" v.s.
   const parts = s.split(' ');
-  let color = parts[parts.length-1].replace(/[^\w\/-]/g,'').toUpperCase();
-  if (!COLOR_WORDS.includes(color)) color = '';
+  let last = parts[parts.length-1];
+  const COLORS = ['SIYAH','BEYAZ','KAHVE','LACIVERT','TABA','GRI','ANTRASIT','SAX','BYZ','SIYAH/BEYAZ','BEYAZ/SIYAH'];
+  let color = COLORS.includes(last) ? last : '';
   const base = color ? s.slice(0, s.lastIndexOf(' '+color)).trim() : s;
   return { baseTitle: base, colorGuess: color };
 }
@@ -145,40 +154,25 @@ function detectFinish(name, desc){
 }
 
 function niceTitle(base, brand, family){
+  // "DST Classica Pelle Di Cuoio Erkek Ayakkabı – MN003 (MOOİEN)"
   const human = base.replace(/^[A-Z]{2}\d{3,5}\s*-\s*/,'').trim();
   return `${human} – ${family} (${brand})`;
 }
 
-/* ---- KATEGORİ / TİP / MALZEME tespit ---- */
-function detectCategory(mainCat, cat, name, desc){
-  const s = uc([mainCat, cat, name, desc].filter(Boolean).join(' '));
-  if(/\bBOT\b/.test(s))          return { slug:'bot',    title:'Bot' };
-  if(/\bSPOR\b/.test(s) || /\bSNEAKER\b/.test(s) || /\bRUNNER\b/.test(s))
-                                 return { slug:'spor',   title:'Spor Ayakkabı' };
-  if(/\bTERL(I|İ)K\b/.test(s))   return { slug:'terlik', title:'Terlik' };
-  if(/\bSAND(A|A)LET\b/.test(s)) return { slug:'sandalet', title:'Sandalet' };
-  if(/\bOUTDOOR\b/.test(s))      return { slug:'outdoor', title:'Outdoor Ayakkabı' };
-  // DERİ, KLASİK vb. -> klasik varsayılan
-  return { slug:'klasik', title:'Klasik Ayakkabı' };
+/* ====== XML parse ====== */
+function specText(specObj){
+  if(specObj==null) return '';
+  if(typeof specObj==='string' || typeof specObj==='number') return String(specObj);
+  if(typeof specObj==='object'){
+    if('#text' in specObj) return String(specObj['#text']);
+    if('text' in specObj)  return String(specObj.text);
+    if('value' in specObj) return String(specObj.value);
+  }
+  return '';
 }
-
-function detectType(name, cat){
-  const s = uc([name,cat].join(' '));
-  if(/\bLOAFER\b/.test(s)) return 'loafer';
-  if(/\bOXFORD\b/.test(s)) return 'oxford';
-  if(/\bDERBY\b/.test(s))  return 'derby';
-  if(/\bSNEAKER\b/.test(s))return 'sneaker';
-  return null;
-}
-
-function detectMaterial(name, desc){
-  const s = uc([name,desc].join(' '));
-  if(/\bKETEN\b/.test(s))        return 'keten';
-  if(/\bS(Ü|U)ET\b/.test(s))     return 'suet';
-  if(/\bNUBUK\b/.test(s))        return 'nubuk';
-  if(/\bVEGAN\b/.test(s))        return 'vegan-deri';
-  if(/\bDER(I|İ)\b/.test(s))     return 'deri';
-  return null;
+function readSpec(specs, wanted){
+  const hit = specs.find(s => uc(s?.name||s?.['@_name']||'') === uc(wanted));
+  return specText(hit).trim();
 }
 
 function parseXML(xml){
@@ -190,60 +184,48 @@ function parseXML(xml){
     const name  = norm(p.Name||'');
     const brand = norm(p.Brand||'') || 'MOOİEN';
     const prodCode = norm(p.Product_code||'');
-    const main  = norm(p.mainCategory||'');
-    const cat   = norm(p.category||'');
-    const desc  = norm(p.Description||'');
-
     const { baseTitle, colorGuess } = extractBaseColor(name);
     const family = extractFamily(name, mpn, prodCode) || mpn || prodCode;
-    const finish = detectFinish(name, desc);
+    const finish = detectFinish(name, p.Description);
+    const klass  = classify(p.mainCategory, p.category);
 
     const price = num(p.Price);
     const tax   = num(p.Tax);
     const imgs  = uniq([p.Image1,p.Image2,p.Image3,p.Image4,p.Image5].filter(Boolean));
+    const descHtml = p.Description || '';
 
-    // Kategori / Tip / Malzeme
-    const K = detectCategory(main, cat, name, desc);
-    const T = detectType(name, cat);
-    const M = detectMaterial(name, desc);
-    const genderTag = /\bERKEK\b/.test(uc(main+cat+name)) ? 'cinsiyet:erkek' : null;
+    const variants = toArr(p?.variants?.variant).map(v=>{
+      const specs = toArr(v?.spec);
+      const renk  = uc(readSpec(specs,'Renk') || colorGuess || 'RENK');
+      const beden = norm(readSpec(specs,'Beden'));
+      const vPrice = num(v.price) || price;
 
-    const variants = []
-      .concat(p?.variants?.variant||[])
-      .map(v=>{
-        const specs = [].concat(v?.spec||[]);
-        const renk  = uc(specs.find(s=>s?.name==='Renk')?.['#text'] || colorGuess || 'RENK');
-        const beden = String(specs.find(s=>s?.name==='Beden')?.['#text'] || '').trim();
-        return {
-          color   : renk,
-          size    : beden || 'Std',
-          finish  : finish || 'Std',
-          sku     : String(v.productCode||v.barcode||v.variantId||'').trim(),
-          barcode : String(v.barcode||'').trim(),
-          qty     : num(v.quantity),
-          price   : num(v.price) || price
-        };
-      });
+      return {
+        color   : renk,
+        size    : beden || 'Std',
+        finish  : finish || 'Std',
+        sku     : String(v.productCode||v.barcode||v.variantId||'').trim(),
+        barcode : String(v.barcode||'').trim(),
+        qty     : num(v.quantity),
+        price   : vPrice
+      };
+    });
 
     const title = niceTitle(baseTitle, brand, family);
-
     const tagModel = `model:${brand}|${family}`;
     const tags = uniq([
       tagModel,
       `brand:${brand}`,
-      `koleksiyon:${K.slug}`,
-      T ? `tip:${T}` : null,
-      M ? `malzeme:${M}` : null,
+      `kategori:${klass.tag}`,
       finish ? `finish:${finish}` : null,
-      genderTag,
       'satis:acik'
     ]);
 
-    return { family, brand, baseTitle, colorGuess, finish, title, price, tax, images:imgs, variants, tagModel, tags, productType: K.title };
+    return { family, brand, baseTitle, colorGuess, finish, title, price, tax, images:imgs, variants, tagModel, tags, descHtml, product_type: klass.type };
   });
 }
 
-/* ---- Aileye göre gruplama (tek Shopify ürünü) ---- */
+/* ====== Aile halinde gruplama ====== */
 function groupByFamily(items){
   const map = new Map();
   for(const it of items){
@@ -251,7 +233,8 @@ function groupByFamily(items){
     if(!map.has(key)){
       map.set(key, {
         family: it.family, brand: it.brand, title: it.title,
-        colors: new Map(), tags: new Set(it.tags||[]), productType: it.productType
+        colors: new Map(), tags: new Set(it.tags||[]),
+        descHtml: it.descHtml, product_type: it.product_type
       });
     }
     const g = map.get(key);
@@ -273,7 +256,6 @@ function groupByFamily(items){
       g.colors.set(c, node);
     }
     (it.tags||[]).forEach(t=>g.tags.add(t));
-    // En anlamlı productType'ı koru (ilk gelen yeterli)
   }
   for(const g of map.values()){
     for(const [c,node] of g.colors.entries()){ delete node._seen; g.colors.set(c,node); }
@@ -315,9 +297,7 @@ async function ensureImages(product, colorMap){
   const toAdd = wantAll.filter(u=>!current.includes(sign(u)));
   for(const src of toAdd){
     try{
-      await rest(`/products/${product.id}/images.json`,'POST',{
-        image:{ src, alt:`SRC:${sign(src)}` }
-      });
+      await rest(`/products/${product.id}/images.json`,'POST',{ image:{ src, alt:`SRC:${sign(src)}` } });
     }catch(e){ console.log('WARN image-add', src, String(e.message||e).slice(0,160)); }
   }
 
@@ -434,12 +414,16 @@ async function upsertVariants(product, colorMap){
 }
 
 /* ====== Ürün oluştur/güncelle ====== */
-async function createProduct(basePayload, seedVariant, firstImage){
+async function createProduct(basePayload, seedVariant, firstImage, wantSizes){
+  const options = wantSizes ? [ {name:'Renk'}, {name:'Beden'} ] : [ {name:'Renk'} ];
+  const seed = { ...varPayload(seedVariant) };
+  if(!wantSizes) delete seed.option2;
+
   const js = await rest(`/products.json`,'POST',{
     product:{
       ...basePayload,
-      options: [ {name:'Renk'}, {name:'Beden'} ],
-      variants: [ { ...varPayload(seedVariant) } ],
+      options,
+      variants: [ seed ],
       images: firstImage ? [{ src:firstImage, alt:`SRC:${sign(firstImage)}` }] : []
     }
   });
@@ -463,6 +447,12 @@ function pickFirstImage(colorMap){
   }
   return null;
 }
+function hasRealSizes(colorMap){
+  for(const [,node] of colorMap.entries()){
+    if((node.variants||[]).some(v=> (v.size && v.size!=='Std'))) return true;
+  }
+  return false;
+}
 
 /* ====== MAIN ====== */
 async function main(){
@@ -482,7 +472,7 @@ async function main(){
         const sizes = uniq(n.variants.map(v=>v.size)).join('/');
         return `${c}(${n.variants.length}v; ${sizes})`;
       }).join(', ');
-      console.log(`GRUP ${g.brand}|${g.family} -> ${colors} | product_type=${g.productType}`);
+      console.log(`GRUP ${g.brand}|${g.family} -> ${colors}`);
     }
   }
 
@@ -493,22 +483,23 @@ async function main(){
 
   for(const g of groups){
     const tagModel = `model:${g.brand}|${g.family}`;
-    const tagsStr = Array.from(g.tags||[]).join(', ');
+
     const basePayload = {
       title: g.title,
-      body_html: '',
+      body_html: g.descHtml || '',
       vendor: g.brand,
-      product_type: g.productType || 'Ayakkabı',
-      tags: tagsStr,
+      product_type: g.product_type,                      // Spor / Klasik / Bot
+      tags: Array.from(g.tags||[]).join(', '),
       status: 'active'
     };
 
+    const wantSizes = hasRealSizes(g.colors);
     const found = index.get(tagModel);
     let prod;
     if(!found){
       const seed = pickSeedVariant(g.colors);
       const firstImg = pickFirstImage(g.colors);
-      prod = await createProduct(basePayload, seed, firstImg);
+      prod = await createProduct(basePayload, seed, firstImg, wantSizes);
       if(prod?.variants?.[0]) await setInventory(prod.variants[0].inventory_item_id, seed.qty);
       await publishProduct(prod.id);
     }else{
@@ -519,15 +510,15 @@ async function main(){
 
     const { totalQty } = await upsertVariants(prod, g.colors);
 
-    // stok etiketi güncelle
-    const tagSet = new Set(tagsStr.split(',').map(t=>t.trim()).filter(Boolean));
+    // stok etiketi
+    const tagSet = new Set((basePayload.tags||'').split(',').map(t=>t.trim()).filter(Boolean));
     if(totalQty>0){ tagSet.delete('satis:kapali'); tagSet.add('satis:acik'); }
     else          { tagSet.delete('satis:acik');   tagSet.add('satis:kapali'); }
     await updateProduct(prod.id, { tags: Array.from(tagSet).join(', ') });
 
     processed++;
     if(processed % BATCH_SIZE === 0) await sleep(800);
-    console.log(`OK: ${clip(g.title)} | Tip: ${g.productType} | Toplam Stok: ${totalQty}`);
+    console.log(`OK: ${clip(g.title)} | Toplam Stok: ${totalQty} | Tip: ${g.product_type}`);
   }
 
   console.log('Bitti. İşlenen aile:', processed);
